@@ -1,0 +1,192 @@
+import os
+import json
+import pandas as pd
+from collections import defaultdict
+
+def process_input_folder(input_folder, output_folder, threshold=70):
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    
+    dfs = []
+    
+    print(f"Reading JSON files from: {input_folder}")
+    
+    file_count = 0
+    for filename in os.listdir(input_folder):
+        if filename.endswith('.json'):
+            file_path = os.path.join(input_folder, filename)
+            file_count += 1
+            
+            try:
+                df = pd.read_json(path_or_buf=file_path, orient='index')
+                df['file_name'] = filename[:-5]
+                dfs.append(df)
+            except Exception as e:
+                print(f"Error processing {filename}: {e}")
+    
+    print(f"Total files processed: {file_count}")
+    
+    if not dfs:
+        print("No valid JSON files found in the input folder.")
+        return
+    
+    final_df = pd.concat(dfs, ignore_index=True)
+    print(f"Total rows after concatenation: {len(final_df)}")
+    
+    filtered_df = final_df[final_df["final_sim_score"] > 0.92]
+    print(f"Rows after filtering for final_sim_score > 0.92: {len(filtered_df)}")
+    
+    rebalance_and_save(filtered_df, output_folder, threshold)
+    
+    saved_clusters_counts = {}
+    for filename in os.listdir(output_folder):
+        if filename.endswith(".json"):
+            file_path = os.path.join(output_folder, filename)
+            df_saved = pd.read_json(file_path, orient='index')
+            saved_clusters_counts[filename] = len(df_saved) // 2
+    
+    print(f"Total clusters created: {len(saved_clusters_counts)}")
+    for filename, pair_count in saved_clusters_counts.items():
+        print(f"{filename}: {pair_count} pairs")
+
+def rebalance_and_save(df, output_folder, threshold=70):
+    if df.empty:
+        print("No data to process after filtering.")
+        return
+    
+    batch_counter = 1
+    
+    label_groups = df.groupby('labels')
+    print(f"Found {len(label_groups)} label groups")
+    
+    for label, label_df in label_groups:
+        pairs = len(label_df) // 2
+        print(f"Processing label {label}: {pairs} pairs")
+        
+        if pairs <= threshold:
+            save_cluster(label_df, output_folder, batch_counter)
+            batch_counter += 1
+        else:
+            if 'content_labels' in label_df.columns:
+                content_label_counts = label_df.groupby('content_labels').size().reset_index(name='count')
+                content_label_counts['pairs'] = content_label_counts['count'] // 2
+                content_label_counts = content_label_counts.sort_values('count', ascending=False)
+                
+                if len(content_label_counts) > 1:
+                    process_multiple_content_labels(label_df, content_label_counts, output_folder, threshold, batch_counter)
+                    batch_counter += len(content_label_counts)
+                else:
+                    split_clusters = split_large_cluster(label_df, threshold)
+                    for cluster in split_clusters:
+                        save_cluster(cluster, output_folder, batch_counter)
+                        batch_counter += 1
+            else:
+                split_clusters = split_large_cluster(label_df, threshold)
+                for cluster in split_clusters:
+                    save_cluster(cluster, output_folder, batch_counter)
+                    batch_counter += 1
+
+def process_multiple_content_labels(df, content_label_counts, output_folder, threshold, batch_counter):
+    large_labels = []
+    medium_labels = []
+    small_labels = []
+    
+    for _, row in content_label_counts.iterrows():
+        content_label = row['content_labels']
+        pairs = row['pairs']
+        
+        if pairs > threshold:
+            large_labels.append(content_label)
+        elif pairs >= 30:  # Medium is 30-70 pairs
+            medium_labels.append(content_label)
+        else:
+            small_labels.append(content_label)
+    
+    print(f"Content labels: Large: {len(large_labels)}, Medium: {len(medium_labels)}, Small: {len(small_labels)}")
+    
+    current_batch = batch_counter
+    
+    if large_labels:
+        for label in large_labels:
+            label_df = df[df['content_labels'] == label]
+            label_pairs = len(label_df) // 2
+            
+            split_clusters = split_large_cluster(label_df, threshold)
+            for cluster in split_clusters:
+                save_cluster(cluster, output_folder, current_batch)
+                current_batch += 1
+    
+    if medium_labels:
+        for label in medium_labels:
+            label_df = df[df['content_labels'] == label]
+            save_cluster(label_df, output_folder, current_batch)
+            current_batch += 1
+    
+    if small_labels:
+        small_dfs = []
+        running_pairs = 0
+        target_pairs = 60  # Target around 60 pairs (120 articles)
+        
+        for label in small_labels:
+            label_df = df[df['content_labels'] == label]
+            pairs = len(label_df) // 2
+            
+            if running_pairs + pairs <= target_pairs:
+                small_dfs.append(label_df)
+                running_pairs += pairs
+            else:
+                if small_dfs:
+                    combined_df = pd.concat(small_dfs, ignore_index=True)
+                    save_cluster(combined_df, output_folder, current_batch)
+                    current_batch += 1
+                
+                small_dfs = [label_df]
+                running_pairs = pairs
+        
+        if small_dfs:
+            combined_df = pd.concat(small_dfs, ignore_index=True)
+            combined_pairs = len(combined_df) // 2
+            print(f"Combined small clusters: {combined_pairs} pairs")
+            save_cluster(combined_df, output_folder, current_batch)
+
+def split_large_cluster(df, threshold):
+    pairs = len(df) // 2
+    
+    if pairs <= threshold + 5:
+        return [df]
+    
+    target_pairs = 60  # Target around 60 pairs per segment
+    num_segments = max(2, round(pairs / target_pairs))
+    
+    print(f"Splitting cluster: {pairs} pairs into {num_segments} segments")
+    
+    segment_size = len(df) // num_segments
+    segments = []
+    
+    for i in range(num_segments):
+        start_idx = i * segment_size
+        end_idx = (i + 1) * segment_size if i < num_segments - 1 else len(df)
+        segment = df.iloc[start_idx:end_idx].copy()
+        segments.append(segment)
+    
+    return segments
+
+def save_cluster(df, output_folder, batch_num):
+    output_file = os.path.join(output_folder, f"Batch_rebalanced_{batch_num}.json")
+    df.to_json(path_or_buf=output_file, orient='index', double_precision=10, indent=4, date_format='iso')
+    
+    pair_count = len(df) // 2
+    print(f"Saved Batch_rebalanced_{batch_num}.json: {pair_count} pairs")
+
+if __name__ == "__main__":
+    input_folder = "./input_json_files"
+    output_folder = "./output_clusters"
+    threshold = 70
+    
+    print(f"Starting cluster rebalancing with threshold: {threshold} pairs")
+    print(f"Input folder: {input_folder}")
+    print(f"Output folder: {output_folder}")
+    
+    process_input_folder(input_folder, output_folder, threshold)
+    
+    print("Cluster rebalancing completed")
