@@ -56,7 +56,16 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
         return
     
     # Continue with rebalancing
-    rebalance_clusters_and_save(filtered_df, output_folder, threshold, min_threshold)
+    clusters = rebalance_clusters(filtered_df, threshold, min_threshold)
+    
+    # Merge small clusters
+    merged_clusters = merge_small_clusters(clusters, min_threshold)
+    
+    # Save merged clusters using sequential numbering
+    for i, cluster in enumerate(merged_clusters):
+        # Ensure we're using sequential numbering
+        batch_num = i + 1  # Start from 1, not 99 or other random numbers
+        save_cluster(cluster, output_folder, batch_num)
     
     # Generate final report
     saved_clusters_counts = {}
@@ -69,130 +78,218 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
     print(f"Total clusters created: {len(saved_clusters_counts)}")
     for filename, pair_count in sorted(saved_clusters_counts.items()):
         print(f"{filename}: {pair_count} pairs")
+        
+    # Check if any clusters are still too small
+    small_clusters = {name: pairs for name, pairs in saved_clusters_counts.items() if pairs < min_threshold}
+    if small_clusters:
+        print(f"WARNING: Found {len(small_clusters)} clusters below minimum threshold of {min_threshold} pairs:")
+        for name, pairs in small_clusters.items():
+            print(f"  - {name}: {pairs} pairs")
+        print("Consider increasing min_threshold or reviewing these clusters manually.")
 
-def rebalance_clusters_and_save(df, output_folder, threshold=70, min_threshold=30):
+def rebalance_clusters(df, threshold=70, min_threshold=30):
     """
-    Rebalance clusters and save them to files.
+    Rebalance clusters and return them as a list of DataFrames.
     
     Args:
         df: DataFrame to process
-        output_folder: Where to save the output files
         threshold: Maximum threshold for cluster size
         min_threshold: Minimum threshold for cluster size
-    """
-    if df.empty:
-        print("No data to process after filtering.")
-        return
     
-    batch_counter = 1
+    Returns:
+        List of DataFrames representing rebalanced clusters
+    """
+    clusters = []
     
     # Check if 'content_labels' column exists
     if 'content_labels' in df.columns:
-        # Get large content labels
+        # Get content label counts
         content_label_counts = df.groupby('content_labels').size().reset_index(name='count')
         content_label_counts['pairs'] = content_label_counts['count'] // 2
         
-        # Identify large content labels (over threshold)
+        # Identify large, medium, and small content labels
         large_labels = content_label_counts[content_label_counts['pairs'] > threshold]['content_labels'].tolist()
-        print(f"Found {len(large_labels)} large content labels that need splitting")
+        medium_labels = content_label_counts[(content_label_counts['pairs'] <= threshold) & 
+                                           (content_label_counts['pairs'] >= min_threshold)]['content_labels'].tolist()
+        small_labels = content_label_counts[content_label_counts['pairs'] < min_threshold]['content_labels'].tolist()
         
-        if large_labels:
-            for label in large_labels:
-                label_df = df[df['content_labels'] == label]
-                label_pairs = len(label_df) // 2
-                print(f"Processing large content label {label}: {label_pairs} pairs")
-                
-                # Calculate how many segments needed (size divide by threshold)
-                num_segments = (label_pairs + threshold - 1) // threshold  # Ceiling division
-                
-                # Split and save
-                split_and_save_cluster(label_df, output_folder, batch_counter, num_segments)
-                batch_counter += num_segments
+        print(f"Content labels: Large: {len(large_labels)}, Medium: {len(medium_labels)}, Small: {len(small_labels)}")
         
-    # Also check for label column (as mentioned in point 3)
-    if 'labels' in df.columns:
-        label_counts = df.groupby('labels').size().reset_index(name='count')
-        label_counts['pairs'] = label_counts['count'] // 2
-        
-        # Process by labels too
-        for _, row in label_counts.iterrows():
-            label = row['labels']
-            pairs = row['pairs']
-            
-            if pairs > threshold:
-                label_df = df[df['labels'] == label]
-                print(f"Processing large label {label}: {pairs} pairs")
-                
-                # Check if this label has been processed via content_labels already
-                if 'content_labels' in df.columns:
-                    content_labels_in_this_label = label_df['content_labels'].unique()
-                    already_processed = any(cl in large_labels for cl in content_labels_in_this_label)
-                    
-                    if already_processed:
-                        print(f"Skipping label {label} as its content labels were already processed")
-                        continue
-                
-                # Calculate segments
-                num_segments = (pairs + threshold - 1) // threshold  # Ceiling division
-                
-                # Split and save
-                split_and_save_cluster(label_df, output_folder, batch_counter, num_segments)
-                batch_counter += num_segments
-    
-    # Process remaining data not covered by large content_labels or labels
-    processed_mask = pd.Series(False, index=df.index)
-    
-    if 'content_labels' in df.columns and large_labels:
+        # Process large content labels - split them
         for label in large_labels:
-            processed_mask = processed_mask | (df['content_labels'] == label)
-    
-    if 'labels' in df.columns:
-        for label in label_counts[label_counts['pairs'] > threshold]['labels']:
-            # Only mark as processed if not already processed by content_labels
-            if 'content_labels' in df.columns:
-                label_df = df[df['labels'] == label]
-                content_labels_in_this_label = label_df['content_labels'].unique()
-                already_processed = any(cl in large_labels for cl in content_labels_in_this_label)
-                
-                if not already_processed:
-                    processed_mask = processed_mask | (df['labels'] == label)
-            else:
-                processed_mask = processed_mask | (df['labels'] == label)
-    
-    remaining_df = df[~processed_mask]
-    remaining_pairs = len(remaining_df) // 2
-    
-    if remaining_pairs > 0:
-        print(f"Processing remaining data: {remaining_pairs} pairs")
+            label_df = df[df['content_labels'] == label]
+            label_pairs = len(label_df) // 2
+            
+            # Calculate segments
+            num_segments = (label_pairs + threshold - 1) // threshold  # Ceiling division
+            segment_size = len(label_df) // num_segments
+            
+            # Split into segments
+            for i in range(num_segments):
+                start_idx = i * segment_size
+                end_idx = (i + 1) * segment_size if i < num_segments - 1 else len(label_df)
+                segment = label_df.iloc[start_idx:end_idx].copy()
+                clusters.append(segment)
         
-        if remaining_pairs <= threshold:
-            # Small enough to keep as is
-            save_cluster(remaining_df, output_folder, batch_counter)
-        else:
-            # Split into appropriate segments
-            num_segments = (remaining_pairs + threshold - 1) // threshold  # Ceiling division
-            split_and_save_cluster(remaining_df, output_folder, batch_counter, num_segments)
+        # Process medium content labels - keep as is
+        for label in medium_labels:
+            label_df = df[df['content_labels'] == label]
+            clusters.append(label_df)
+        
+        # Process small content labels - collect for later merging
+        small_content_dfs = []
+        for label in small_labels:
+            label_df = df[df['content_labels'] == label]
+            small_content_dfs.append(label_df)
+        
+        # If there are small content labels, add them to clusters
+        # They will be merged later
+        clusters.extend(small_content_dfs)
+    
+    # Also check for label groups
+    if 'labels' in df.columns:
+        # Filter out rows already processed by content_labels
+        processed_mask = pd.Series(False, index=df.index)
+        
+        if 'content_labels' in df.columns:
+            for label in content_label_counts['content_labels']:
+                processed_mask = processed_mask | (df['content_labels'] == label)
+        
+        remaining_df = df[~processed_mask]
+        
+        if len(remaining_df) > 0:
+            # Process remaining data by labels
+            label_counts = remaining_df.groupby('labels').size().reset_index(name='count')
+            label_counts['pairs'] = label_counts['count'] // 2
+            
+            for _, row in label_counts.iterrows():
+                label = row['labels']
+                pairs = row['pairs']
+                
+                label_df = remaining_df[remaining_df['labels'] == label]
+                
+                if pairs > threshold:
+                    # Split large label groups
+                    num_segments = (pairs + threshold - 1) // threshold  # Ceiling division
+                    segment_size = len(label_df) // num_segments
+                    
+                    for i in range(num_segments):
+                        start_idx = i * segment_size
+                        end_idx = (i + 1) * segment_size if i < num_segments - 1 else len(label_df)
+                        segment = label_df.iloc[start_idx:end_idx].copy()
+                        clusters.append(segment)
+                else:
+                    # Keep small/medium label groups as is
+                    clusters.append(label_df)
+    
+    return clusters
 
-def split_and_save_cluster(df, output_folder, start_batch_num, num_segments):
+def merge_small_clusters(clusters, min_threshold):
     """
-    Split a cluster into specified number of segments and save them.
+    Merge small clusters until they meet the minimum threshold.
     
     Args:
-        df: DataFrame to split
-        output_folder: Where to save the output files
-        start_batch_num: Starting batch number
-        num_segments: Number of segments to split into
-    """
-    total_rows = len(df)
-    segment_size = total_rows // num_segments
-    
-    for i in range(num_segments):
-        start_idx = i * segment_size
-        end_idx = (i + 1) * segment_size if i < num_segments - 1 else total_rows
-        segment = df.iloc[start_idx:end_idx].copy()
+        clusters: List of DataFrame clusters
+        min_threshold: Minimum number of pairs
         
-        batch_num = start_batch_num + i
-        save_cluster(segment, output_folder, batch_num)
+    Returns:
+        List of merged DataFrame clusters
+    """
+    if not clusters:
+        return []
+        
+    # Calculate pairs for each cluster
+    clusters_with_pairs = [(cluster, len(cluster) // 2) for cluster in clusters]
+    
+    # Sort by size (smallest first)
+    sorted_clusters = sorted(clusters_with_pairs, key=lambda x: x[1])
+    
+    # If we only have one cluster, return it regardless of size
+    if len(sorted_clusters) == 1:
+        return [sorted_clusters[0][0]]
+    
+    result = []
+    small_clusters = []
+    
+    # Separate clusters into valid and small ones
+    for cluster, pairs in sorted_clusters:
+        if pairs >= min_threshold:
+            result.append(cluster)
+        else:
+            small_clusters.append((cluster, pairs))
+    
+    print(f"Found {len(small_clusters)} clusters below minimum threshold")
+    
+    # If no small clusters, return the original valid clusters
+    if not small_clusters:
+        return result
+    
+    # Iteratively merge small clusters
+    while small_clusters:
+        # If only one small cluster left, merge it with the smallest valid cluster
+        if len(small_clusters) == 1:
+            small_df, small_pairs = small_clusters[0]
+            
+            # If we already have valid clusters, merge with the smallest one
+            if result:
+                # Find the smallest valid cluster
+                smallest_idx = min(range(len(result)), key=lambda i: len(result[i]))
+                result[smallest_idx] = pd.concat([result[smallest_idx], small_df], ignore_index=True)
+                print(f"Merged last small cluster ({small_pairs} pairs) with existing cluster")
+            else:
+                # No valid clusters exist, just add it (will trigger warning later)
+                result.append(small_df)
+                print(f"WARNING: Had to keep a small cluster with only {small_pairs} pairs")
+            
+            # We've processed the last small cluster
+            break
+        
+        # Take the two smallest clusters
+        smallest1 = small_clusters.pop(0)
+        smallest2 = small_clusters.pop(0)
+        
+        # Merge them
+        merged_df = pd.concat([smallest1[0], smallest2[0]], ignore_index=True)
+        merged_pairs = len(merged_df) // 2
+        
+        # Check if the merged cluster is now valid
+        if merged_pairs >= min_threshold:
+            result.append(merged_df)
+            print(f"Created valid cluster with {merged_pairs} pairs by merging")
+        else:
+            # Still too small, put back in the list for further merging
+            small_clusters.append((merged_df, merged_pairs))
+            # Re-sort to keep the smallest clusters at the front
+            small_clusters.sort(key=lambda x: x[1])
+            print(f"Merged two small clusters, but still below threshold ({merged_pairs} pairs)")
+    
+    print(f"After merging: {len(result)} valid clusters")
+    
+    # Final sanity check - ensure no tiny clusters
+    final_result = []
+    remaining_small = []
+    
+    for cluster in result:
+        pairs = len(cluster) // 2
+        if pairs >= min_threshold:
+            final_result.append(cluster)
+        else:
+            remaining_small.append(cluster)
+    
+    # If any small clusters remain, merge them with the smallest valid cluster
+    if remaining_small and final_result:
+        smallest_idx = min(range(len(final_result)), key=lambda i: len(final_result[i]))
+        for small_df in remaining_small:
+            final_result[smallest_idx] = pd.concat([final_result[smallest_idx], small_df], ignore_index=True)
+        
+        print(f"Merged {len(remaining_small)} remaining small clusters with valid cluster")
+    elif remaining_small:
+        # No valid clusters to merge with, combine all small clusters
+        combined = pd.concat(remaining_small, ignore_index=True)
+        final_result.append(combined)
+        print(f"WARNING: Combined all small clusters, resulting in {len(combined)//2} pairs")
+    
+    return final_result
 
 def save_cluster(df, output_folder, batch_num):
     """
