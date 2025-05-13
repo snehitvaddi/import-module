@@ -113,7 +113,10 @@ def rebalance_clusters(df, threshold=70, min_threshold=30):
                                            (content_label_counts['pairs'] >= min_threshold)]['content_labels'].tolist()
         small_labels = content_label_counts[content_label_counts['pairs'] < min_threshold]['content_labels'].tolist()
         
-        print(f"Content labels: Large: {len(large_labels)}, Medium: {len(medium_labels)}, Small: {len(small_labels)}")
+        print(f"Content labels breakdown:")
+        print(f"  - LARGE (>{threshold} pairs): {len(large_labels)} labels")
+        print(f"  - MEDIUM ({min_threshold}-{threshold} pairs): {len(medium_labels)} labels")
+        print(f"  - SMALL (<{min_threshold} pairs): {len(small_labels)} labels")
         
         # Process large content labels - split them
         for label in large_labels:
@@ -124,22 +127,30 @@ def rebalance_clusters(df, threshold=70, min_threshold=30):
             num_segments = (label_pairs + threshold - 1) // threshold  # Ceiling division
             segment_size = len(label_df) // num_segments
             
+            print(f"SPLITTING: content_label={label} with {label_pairs} pairs into {num_segments} segments")
+            
             # Split into segments
             for i in range(num_segments):
                 start_idx = i * segment_size
                 end_idx = (i + 1) * segment_size if i < num_segments - 1 else len(label_df)
                 segment = label_df.iloc[start_idx:end_idx].copy()
+                segment_pairs = len(segment) // 2
+                print(f"  - Created segment {i+1}/{num_segments}: {segment_pairs} pairs")
                 clusters.append(segment)
         
         # Process medium content labels - keep as is
         for label in medium_labels:
             label_df = df[df['content_labels'] == label]
+            label_pairs = len(label_df) // 2
+            print(f"KEEPING: content_label={label} with {label_pairs} pairs (within threshold)")
             clusters.append(label_df)
         
         # Process small content labels - collect for later merging
         small_content_dfs = []
         for label in small_labels:
             label_df = df[df['content_labels'] == label]
+            label_pairs = len(label_df) // 2
+            print(f"MARKING FOR MERGE: content_label={label} with {label_pairs} pairs (below min threshold)")
             small_content_dfs.append(label_df)
         
         # If there are small content labels, add them to clusters
@@ -162,6 +173,8 @@ def rebalance_clusters(df, threshold=70, min_threshold=30):
             label_counts = remaining_df.groupby('labels').size().reset_index(name='count')
             label_counts['pairs'] = label_counts['count'] // 2
             
+            print(f"Processing remaining rows by labels:")
+            
             for _, row in label_counts.iterrows():
                 label = row['labels']
                 pairs = row['pairs']
@@ -173,13 +186,22 @@ def rebalance_clusters(df, threshold=70, min_threshold=30):
                     num_segments = (pairs + threshold - 1) // threshold  # Ceiling division
                     segment_size = len(label_df) // num_segments
                     
+                    print(f"SPLITTING: label={label} with {pairs} pairs into {num_segments} segments")
+                    
                     for i in range(num_segments):
                         start_idx = i * segment_size
                         end_idx = (i + 1) * segment_size if i < num_segments - 1 else len(label_df)
                         segment = label_df.iloc[start_idx:end_idx].copy()
+                        segment_pairs = len(segment) // 2
+                        print(f"  - Created segment {i+1}/{num_segments}: {segment_pairs} pairs")
                         clusters.append(segment)
+                elif pairs >= min_threshold:
+                    # Keep medium label groups as is
+                    print(f"KEEPING: label={label} with {pairs} pairs (within threshold)")
+                    clusters.append(label_df)
                 else:
-                    # Keep small/medium label groups as is
+                    # Small label groups for merging
+                    print(f"MARKING FOR MERGE: label={label} with {pairs} pairs (below min threshold)")
                     clusters.append(label_df)
     
     return clusters
@@ -218,7 +240,7 @@ def merge_small_clusters(clusters, min_threshold):
         else:
             small_clusters.append((cluster, pairs))
     
-    print(f"Found {len(small_clusters)} clusters below minimum threshold")
+    print(f"MERGING: Found {len(small_clusters)} clusters below minimum threshold of {min_threshold} pairs")
     
     # If no small clusters, return the original valid clusters
     if not small_clusters:
@@ -234,8 +256,10 @@ def merge_small_clusters(clusters, min_threshold):
             if result:
                 # Find the smallest valid cluster
                 smallest_idx = min(range(len(result)), key=lambda i: len(result[i]))
+                smallest_size = len(result[smallest_idx]) // 2
                 result[smallest_idx] = pd.concat([result[smallest_idx], small_df], ignore_index=True)
-                print(f"Merged last small cluster ({small_pairs} pairs) with existing cluster")
+                new_size = len(result[smallest_idx]) // 2
+                print(f"MERGING: Last small cluster ({small_pairs} pairs) with existing cluster ({smallest_size} pairs) -> {new_size} pairs")
             else:
                 # No valid clusters exist, just add it (will trigger warning later)
                 result.append(small_df)
@@ -252,18 +276,20 @@ def merge_small_clusters(clusters, min_threshold):
         merged_df = pd.concat([smallest1[0], smallest2[0]], ignore_index=True)
         merged_pairs = len(merged_df) // 2
         
+        print(f"MERGING: Combined two clusters ({smallest1[1]} pairs + {smallest2[1]} pairs = {merged_pairs} pairs)")
+        
         # Check if the merged cluster is now valid
         if merged_pairs >= min_threshold:
             result.append(merged_df)
-            print(f"Created valid cluster with {merged_pairs} pairs by merging")
+            print(f"  - SUCCESS: Created valid cluster with {merged_pairs} pairs by merging")
         else:
             # Still too small, put back in the list for further merging
             small_clusters.append((merged_df, merged_pairs))
             # Re-sort to keep the smallest clusters at the front
             small_clusters.sort(key=lambda x: x[1])
-            print(f"Merged two small clusters, but still below threshold ({merged_pairs} pairs)")
+            print(f"  - STILL SMALL: Merged cluster has {merged_pairs} pairs (below threshold)")
     
-    print(f"After merging: {len(result)} valid clusters")
+    print(f"MERGING COMPLETED: {len(result)} valid clusters")
     
     # Final sanity check - ensure no tiny clusters
     final_result = []
@@ -279,15 +305,21 @@ def merge_small_clusters(clusters, min_threshold):
     # If any small clusters remain, merge them with the smallest valid cluster
     if remaining_small and final_result:
         smallest_idx = min(range(len(final_result)), key=lambda i: len(final_result[i]))
-        for small_df in remaining_small:
-            final_result[smallest_idx] = pd.concat([final_result[smallest_idx], small_df], ignore_index=True)
+        original_size = len(final_result[smallest_idx]) // 2
         
-        print(f"Merged {len(remaining_small)} remaining small clusters with valid cluster")
+        for small_df in remaining_small:
+            small_size = len(small_df) // 2
+            final_result[smallest_idx] = pd.concat([final_result[smallest_idx], small_df], ignore_index=True)
+            print(f"FINAL MERGE: Small cluster ({small_size} pairs) merged with cluster ({original_size} pairs)")
+            original_size = len(final_result[smallest_idx]) // 2
+        
+        print(f"FINAL MERGE: After merging all remaining small clusters, size is {original_size} pairs")
     elif remaining_small:
         # No valid clusters to merge with, combine all small clusters
         combined = pd.concat(remaining_small, ignore_index=True)
+        combined_pairs = len(combined) // 2
         final_result.append(combined)
-        print(f"WARNING: Combined all small clusters, resulting in {len(combined)//2} pairs")
+        print(f"WARNING: Combined all remaining small clusters, resulting in {combined_pairs} pairs")
     
     return final_result
 
