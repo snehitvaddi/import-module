@@ -1,353 +1,74 @@
 import os
 import json
-import pandas as pd
-from collections import defaultdict
 
-def process_input_folder(input_folder, output_folder, threshold=70, min_threshold=30):
+def reformat_all_cluster_files(folder_path):
     """
-    Process all JSON files in the input folder and save rebalanced clusters to the output folder.
+    Read all Batch_rebalanced_*.json files in the given folder,
+    reformat them with the expected column order, and save them back.
     
     Args:
-        input_folder: Path to folder containing JSON files
-        output_folder: Path to save output cluster files
-        threshold: Threshold for determining small/medium/large clusters (default: 70)
-        min_threshold: Minimum threshold for cluster size (default: 30)
+        folder_path: Path to the folder containing the JSON files
     """
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+    # Expected columns in the desired order
+    expected_columns = [
+        'ArticleNumber', 'CHANNELS', 'Title', 'BW_Article_Details_c', 
+        'Last_Published_Date', 'highlight_chunk', 'version_number', 
+        'final_sim_score', 'ROLES', 'URL'
+    ]
     
-    dfs = []
-    
-    print(f"Reading JSON files from: {input_folder}")
-    
-    file_count = 0
-    for filename in os.listdir(input_folder):
-        if filename.endswith('.json'):
-            file_path = os.path.join(input_folder, filename)
-            file_count += 1
+    # Find all batch_rebalanced_*.json files
+    files_processed = 0
+    for filename in os.listdir(folder_path):
+        if filename.startswith("Batch_rebalanced_") and filename.endswith(".json"):
+            file_path = os.path.join(folder_path, filename)
+            print(f"Processing {filename}...")
             
             try:
-                df = pd.read_json(path_or_buf=file_path, orient='index')
-                df['file_name'] = filename[:-5]
-                dfs.append(df)
+                # Read the JSON file
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    try:
+                        data = json.load(f)
+                    except json.JSONDecodeError:
+                        print(f"  ERROR: {filename} is not a valid JSON file. Skipping.")
+                        continue
+                
+                # Reformat each record
+                reformatted_data = []
+                for record in data:
+                    # Fix column names by removing escapes and quotes
+                    fixed_record = {}
+                    for key, value in record.items():
+                        clean_key = key.replace('\\', '').replace('\"', '')
+                        fixed_record[clean_key] = value
+                    
+                    # Create a new ordered record with expected columns first
+                    ordered_record = {}
+                    
+                    # Add expected columns in order (if they exist)
+                    for col in expected_columns:
+                        if col in fixed_record:
+                            ordered_record[col] = fixed_record[col]
+                    
+                    # Add any remaining columns
+                    for key, value in fixed_record.items():
+                        if key not in ordered_record:
+                            ordered_record[key] = value
+                    
+                    reformatted_data.append(ordered_record)
+                
+                # Write the reformatted data back to the file
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(reformatted_data, f, indent=2, ensure_ascii=False)
+                
+                print(f"  SUCCESS: Reformatted {filename} with {len(reformatted_data)} records")
+                files_processed += 1
+                
             except Exception as e:
-                print(f"Error processing {filename}: {e}")
+                print(f"  ERROR: Failed to process {filename}: {e}")
     
-    print(f"Total files processed: {file_count}")
-    
-    if not dfs:
-        print("No valid JSON files found in the input folder.")
-        return
-    
-    final_df = pd.concat(dfs, ignore_index=True)
-    print(f"Total rows after concatenation: {len(final_df)}")
-    
-    filtered_df = final_df[final_df["final_sim_score"] > 0.92]
-    print(f"Rows after filtering for final_sim_score > 0.92: {len(filtered_df)}")
-    
-    # 1. Initially check the number of pairs regardless of columns
-    total_pairs = len(filtered_df) // 2
-    print(f"Total number of pairs: {total_pairs}")
-    
-    # If less than threshold pairs (140 articles), do nothing - just save as is
-    if total_pairs <= threshold:
-        print(f"Total pairs ({total_pairs}) is less than threshold ({threshold}). Saving as is.")
-        save_cluster(filtered_df, output_folder, 1)
-        return
-    
-    # Continue with rebalancing
-    clusters = rebalance_clusters(filtered_df, threshold, min_threshold)
-    
-    # Merge small clusters
-    merged_clusters = merge_small_clusters(clusters, min_threshold)
-    
-    # Save merged clusters using sequential numbering
-    for i, cluster in enumerate(merged_clusters):
-        # Ensure we're using sequential numbering
-        batch_num = i + 1  # Start from 1, not 99 or other random numbers
-        save_cluster(cluster, output_folder, batch_num)
-    
-    # Generate final report
-    saved_clusters_counts = {}
-    for filename in os.listdir(output_folder):
-        if filename.endswith(".json"):
-            file_path = os.path.join(output_folder, filename)
-            df_saved = pd.read_json(file_path, orient='index')
-            saved_clusters_counts[filename] = len(df_saved) // 2
-    
-    print(f"Total clusters created: {len(saved_clusters_counts)}")
-    for filename, pair_count in sorted(saved_clusters_counts.items()):
-        print(f"{filename}: {pair_count} pairs")
-        
-    # Check if any clusters are still too small
-    small_clusters = {name: pairs for name, pairs in saved_clusters_counts.items() if pairs < min_threshold}
-    if small_clusters:
-        print(f"WARNING: Found {len(small_clusters)} clusters below minimum threshold of {min_threshold} pairs:")
-        for name, pairs in small_clusters.items():
-            print(f"  - {name}: {pairs} pairs")
-        print("Consider increasing min_threshold or reviewing these clusters manually.")
+    print(f"Reformatting complete: {files_processed} files processed")
 
-def rebalance_clusters(df, threshold=70, min_threshold=30):
-    """
-    Rebalance clusters and return them as a list of DataFrames.
-    
-    Args:
-        df: DataFrame to process
-        threshold: Maximum threshold for cluster size
-        min_threshold: Minimum threshold for cluster size
-    
-    Returns:
-        List of DataFrames representing rebalanced clusters
-    """
-    clusters = []
-    
-    # Check if 'content_labels' column exists
-    if 'content_labels' in df.columns:
-        # Get content label counts
-        content_label_counts = df.groupby('content_labels').size().reset_index(name='count')
-        content_label_counts['pairs'] = content_label_counts['count'] // 2
-        
-        # Identify large, medium, and small content labels
-        large_labels = content_label_counts[content_label_counts['pairs'] > threshold]['content_labels'].tolist()
-        medium_labels = content_label_counts[(content_label_counts['pairs'] <= threshold) & 
-                                           (content_label_counts['pairs'] >= min_threshold)]['content_labels'].tolist()
-        small_labels = content_label_counts[content_label_counts['pairs'] < min_threshold]['content_labels'].tolist()
-        
-        print(f"Content labels breakdown:")
-        print(f"  - LARGE (>{threshold} pairs): {len(large_labels)} labels")
-        print(f"  - MEDIUM ({min_threshold}-{threshold} pairs): {len(medium_labels)} labels")
-        print(f"  - SMALL (<{min_threshold} pairs): {len(small_labels)} labels")
-        
-        # Process large content labels - split them
-        for label in large_labels:
-            label_df = df[df['content_labels'] == label]
-            label_pairs = len(label_df) // 2
-            
-            # Calculate segments
-            num_segments = (label_pairs + threshold - 1) // threshold  # Ceiling division
-            segment_size = len(label_df) // num_segments
-            
-            print(f"SPLITTING: content_label={label} with {label_pairs} pairs into {num_segments} segments")
-            
-            # Split into segments
-            for i in range(num_segments):
-                start_idx = i * segment_size
-                end_idx = (i + 1) * segment_size if i < num_segments - 1 else len(label_df)
-                segment = label_df.iloc[start_idx:end_idx].copy()
-                segment_pairs = len(segment) // 2
-                print(f"  - Created segment {i+1}/{num_segments}: {segment_pairs} pairs")
-                clusters.append(segment)
-        
-        # Process medium content labels - keep as is
-        for label in medium_labels:
-            label_df = df[df['content_labels'] == label]
-            label_pairs = len(label_df) // 2
-            print(f"KEEPING: content_label={label} with {label_pairs} pairs (within threshold)")
-            clusters.append(label_df)
-        
-        # Process small content labels - collect for later merging
-        small_content_dfs = []
-        for label in small_labels:
-            label_df = df[df['content_labels'] == label]
-            label_pairs = len(label_df) // 2
-            print(f"MARKING FOR MERGE: content_label={label} with {label_pairs} pairs (below min threshold)")
-            small_content_dfs.append(label_df)
-        
-        # If there are small content labels, add them to clusters
-        # They will be merged later
-        clusters.extend(small_content_dfs)
-    
-    # Also check for label groups
-    if 'labels' in df.columns:
-        # Filter out rows already processed by content_labels
-        processed_mask = pd.Series(False, index=df.index)
-        
-        if 'content_labels' in df.columns:
-            for label in content_label_counts['content_labels']:
-                processed_mask = processed_mask | (df['content_labels'] == label)
-        
-        remaining_df = df[~processed_mask]
-        
-        if len(remaining_df) > 0:
-            # Process remaining data by labels
-            label_counts = remaining_df.groupby('labels').size().reset_index(name='count')
-            label_counts['pairs'] = label_counts['count'] // 2
-            
-            print(f"Processing remaining rows by labels:")
-            
-            for _, row in label_counts.iterrows():
-                label = row['labels']
-                pairs = row['pairs']
-                
-                label_df = remaining_df[remaining_df['labels'] == label]
-                
-                if pairs > threshold:
-                    # Split large label groups
-                    num_segments = (pairs + threshold - 1) // threshold  # Ceiling division
-                    segment_size = len(label_df) // num_segments
-                    
-                    print(f"SPLITTING: label={label} with {pairs} pairs into {num_segments} segments")
-                    
-                    for i in range(num_segments):
-                        start_idx = i * segment_size
-                        end_idx = (i + 1) * segment_size if i < num_segments - 1 else len(label_df)
-                        segment = label_df.iloc[start_idx:end_idx].copy()
-                        segment_pairs = len(segment) // 2
-                        print(f"  - Created segment {i+1}/{num_segments}: {segment_pairs} pairs")
-                        clusters.append(segment)
-                elif pairs >= min_threshold:
-                    # Keep medium label groups as is
-                    print(f"KEEPING: label={label} with {pairs} pairs (within threshold)")
-                    clusters.append(label_df)
-                else:
-                    # Small label groups for merging
-                    print(f"MARKING FOR MERGE: label={label} with {pairs} pairs (below min threshold)")
-                    clusters.append(label_df)
-    
-    return clusters
-
-def merge_small_clusters(clusters, min_threshold):
-    """
-    Merge small clusters until they meet the minimum threshold.
-    
-    Args:
-        clusters: List of DataFrame clusters
-        min_threshold: Minimum number of pairs
-        
-    Returns:
-        List of merged DataFrame clusters
-    """
-    if not clusters:
-        return []
-        
-    # Calculate pairs for each cluster
-    clusters_with_pairs = [(cluster, len(cluster) // 2) for cluster in clusters]
-    
-    # Sort by size (smallest first)
-    sorted_clusters = sorted(clusters_with_pairs, key=lambda x: x[1])
-    
-    # If we only have one cluster, return it regardless of size
-    if len(sorted_clusters) == 1:
-        return [sorted_clusters[0][0]]
-    
-    result = []
-    small_clusters = []
-    
-    # Separate clusters into valid and small ones
-    for cluster, pairs in sorted_clusters:
-        if pairs >= min_threshold:
-            result.append(cluster)
-        else:
-            small_clusters.append((cluster, pairs))
-    
-    print(f"MERGING: Found {len(small_clusters)} clusters below minimum threshold of {min_threshold} pairs")
-    
-    # If no small clusters, return the original valid clusters
-    if not small_clusters:
-        return result
-    
-    # Iteratively merge small clusters
-    while small_clusters:
-        # If only one small cluster left, merge it with the smallest valid cluster
-        if len(small_clusters) == 1:
-            small_df, small_pairs = small_clusters[0]
-            
-            # If we already have valid clusters, merge with the smallest one
-            if result:
-                # Find the smallest valid cluster
-                smallest_idx = min(range(len(result)), key=lambda i: len(result[i]))
-                smallest_size = len(result[smallest_idx]) // 2
-                result[smallest_idx] = pd.concat([result[smallest_idx], small_df], ignore_index=True)
-                new_size = len(result[smallest_idx]) // 2
-                print(f"MERGING: Last small cluster ({small_pairs} pairs) with existing cluster ({smallest_size} pairs) -> {new_size} pairs")
-            else:
-                # No valid clusters exist, just add it (will trigger warning later)
-                result.append(small_df)
-                print(f"WARNING: Had to keep a small cluster with only {small_pairs} pairs")
-            
-            # We've processed the last small cluster
-            break
-        
-        # Take the two smallest clusters
-        smallest1 = small_clusters.pop(0)
-        smallest2 = small_clusters.pop(0)
-        
-        # Merge them
-        merged_df = pd.concat([smallest1[0], smallest2[0]], ignore_index=True)
-        merged_pairs = len(merged_df) // 2
-        
-        print(f"MERGING: Combined two clusters ({smallest1[1]} pairs + {smallest2[1]} pairs = {merged_pairs} pairs)")
-        
-        # Check if the merged cluster is now valid
-        if merged_pairs >= min_threshold:
-            result.append(merged_df)
-            print(f"  - SUCCESS: Created valid cluster with {merged_pairs} pairs by merging")
-        else:
-            # Still too small, put back in the list for further merging
-            small_clusters.append((merged_df, merged_pairs))
-            # Re-sort to keep the smallest clusters at the front
-            small_clusters.sort(key=lambda x: x[1])
-            print(f"  - STILL SMALL: Merged cluster has {merged_pairs} pairs (below threshold)")
-    
-    print(f"MERGING COMPLETED: {len(result)} valid clusters")
-    
-    # Final sanity check - ensure no tiny clusters
-    final_result = []
-    remaining_small = []
-    
-    for cluster in result:
-        pairs = len(cluster) // 2
-        if pairs >= min_threshold:
-            final_result.append(cluster)
-        else:
-            remaining_small.append(cluster)
-    
-    # If any small clusters remain, merge them with the smallest valid cluster
-    if remaining_small and final_result:
-        smallest_idx = min(range(len(final_result)), key=lambda i: len(final_result[i]))
-        original_size = len(final_result[smallest_idx]) // 2
-        
-        for small_df in remaining_small:
-            small_size = len(small_df) // 2
-            final_result[smallest_idx] = pd.concat([final_result[smallest_idx], small_df], ignore_index=True)
-            print(f"FINAL MERGE: Small cluster ({small_size} pairs) merged with cluster ({original_size} pairs)")
-            original_size = len(final_result[smallest_idx]) // 2
-        
-        print(f"FINAL MERGE: After merging all remaining small clusters, size is {original_size} pairs")
-    elif remaining_small:
-        # No valid clusters to merge with, combine all small clusters
-        combined = pd.concat(remaining_small, ignore_index=True)
-        combined_pairs = len(combined) // 2
-        final_result.append(combined)
-        print(f"WARNING: Combined all remaining small clusters, resulting in {combined_pairs} pairs")
-    
-    return final_result
-
-def save_cluster(df, output_folder, batch_num):
-    """
-    Save a cluster to a JSON file.
-    
-    Args:
-        df: DataFrame to save
-        output_folder: Where to save the file
-        batch_num: Batch number for file naming
-    """
-    output_file = os.path.join(output_folder, f"Batch_rebalanced_{batch_num}.json")
-    df.to_json(path_or_buf=output_file, orient='index', double_precision=10, indent=4, date_format='iso')
-    
-    pair_count = len(df) // 2
-    print(f"Saved Batch_rebalanced_{batch_num}.json: {pair_count} pairs")
-
-if __name__ == "__main__":
-    input_folder = "./input_json_files"
-    output_folder = "./output_clusters"
-    threshold = 70  # Passed as parameter as required in point 4
-    min_threshold = 30
-    
-    print(f"Starting cluster rebalancing with threshold: {threshold} pairs")
-    print(f"Input folder: {input_folder}")
-    print(f"Output folder: {output_folder}")
-    
-    process_input_folder(input_folder, output_folder, threshold, min_threshold)
-    
-    print("Cluster rebalancing completed")
+# Example usage:
+# Just change this to your actual output folder path
+output_folder = "./output_clusters"
+reformat_all_cluster_files(output_folder)
