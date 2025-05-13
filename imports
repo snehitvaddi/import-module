@@ -2,32 +2,28 @@ import os
 import json
 
 def reformat_all_cluster_files(folder_path):
-    """
-    Read all Batch_rebalanced_*.json files in the given folder,
-    reformat them with the expected column order, and save them back.
-    
-    Args:
-        folder_path: Path to the folder containing the JSON files
-    """
-    # Expected columns in the desired order
     expected_columns = [
-        'ArticleNumber', 'CHANNELS', 'Title', 'BW_Article_Details_c', 
-        'Last_Published_Date', 'highlight_chunk', 'version_number', 
+        'ArticleNumber', 'CHANNELS', 'Title', 'BW_Article_Details_c',
+        'Last_Published_Date', 'highlight_chunk', 'version_number',
         'final_sim_score', 'ROLES', 'URL'
     ]
     
-    # Find all batch_rebalanced_*.json files
     files_processed = 0
     for filename in os.listdir(folder_path):
         if filename.startswith("Batch_rebalanced_") and filename.endswith(".json"):
             file_path = os.path.join(folder_path, filename)
             print(f"Processing {filename}...")
             
+            # Create a temporary file path
+            temp_file = file_path + ".temp"
+            
             try:
                 # Read the JSON file
                 with open(file_path, 'r', encoding='utf-8') as f:
                     try:
                         data = json.load(f)
+                        if isinstance(data, dict):
+                            data = [data]  # Convert single JSON object to list
                     except json.JSONDecodeError:
                         print(f"  ERROR: {filename} is not a valid JSON file. Skipping.")
                         continue
@@ -35,13 +31,15 @@ def reformat_all_cluster_files(folder_path):
                 # Reformat each record
                 reformatted_data = []
                 for record in data:
-                    # Fix column names by removing escapes and quotes
+                    if not isinstance(record, dict):
+                        print(f"  ERROR: Record is not a dictionary. Skipping.")
+                        continue
+                    
                     fixed_record = {}
                     for key, value in record.items():
                         clean_key = key.replace('\\', '').replace('\"', '')
                         fixed_record[clean_key] = value
                     
-                    # Create a new ordered record with expected columns first
                     ordered_record = {}
                     
                     # Add expected columns in order (if they exist)
@@ -56,19 +54,36 @@ def reformat_all_cluster_files(folder_path):
                     
                     reformatted_data.append(ordered_record)
                 
-                # Write the reformatted data back to the file
-                with open(file_path, 'w', encoding='utf-8') as f:
+                # Write to temporary file first
+                with open(temp_file, 'w', encoding='utf-8') as f:
                     json.dump(reformatted_data, f, indent=2, ensure_ascii=False)
                 
-                print(f"  SUCCESS: Reformatted {filename} with {len(reformatted_data)} records")
-                files_processed += 1
-                
+                # Verify temp file was written successfully
+                if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                    # On Windows, we need to remove the destination file first
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    
+                    # Rename the temp file to the original name
+                    os.rename(temp_file, file_path)
+                    
+                    files_processed += 1
+                    print(f"  SUCCESS: Reformatted {filename}")
+                else:
+                    print(f"  ERROR: Failed to write temporary file")
+                    
             except Exception as e:
                 print(f"  ERROR: Failed to process {filename}: {e}")
+                
+                # Clean up temp file if it exists
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
     
     print(f"Reformatting complete: {files_processed} files processed")
 
-# Example usage:
-# Just change this to your actual output folder path
-output_folder = "./output_clusters"
+# Update this path to your actual folder
+output_folder = ""
 reformat_all_cluster_files(output_folder)
