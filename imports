@@ -72,8 +72,10 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
     
     all_clusters = valid_clusters + merged_clusters
     
+    final_clusters = resolve_final_label_violations(all_clusters)
+    
     saved_count = 0
-    for cluster in all_clusters:
+    for cluster in final_clusters:
         saved_count += 1
         save_cluster(cluster, output_folder, saved_count)
     
@@ -125,6 +127,64 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
         print(f"\nWARNING: Found {len(final_label_violations)} clusters violating final_label constraint")
         for filename, violations in final_label_violations.items():
             print(f"  - {filename}: {violations}")
+
+def resolve_final_label_violations(clusters):
+    result_clusters = []
+    problem_rows = pd.DataFrame()
+    
+    for cluster in clusters:
+        if 'final_label' not in cluster.columns:
+            result_clusters.append(cluster)
+            continue
+            
+        final_label_counts = cluster.groupby('final_label').size()
+        violations = final_label_counts[final_label_counts > 2]
+        
+        if violations.empty:
+            result_clusters.append(cluster)
+            continue
+            
+        print(f"Found cluster with {len(violations)} final_label violations")
+        clean_cluster = cluster.copy()
+        
+        for label in violations.index:
+            label_rows = clean_cluster[clean_cluster['final_label'] == label]
+            
+            if len(label_rows) > 2:
+                rows_to_keep = label_rows.iloc[:2]
+                rows_to_move = label_rows.iloc[2:]
+                
+                clean_cluster = clean_cluster[~clean_cluster.index.isin(rows_to_move.index)]
+                problem_rows = pd.concat([problem_rows, rows_to_move], ignore_index=True)
+                
+                print(f"  - Extracted {len(rows_to_move)} excess rows for label {label}")
+        
+        if not clean_cluster.empty:
+            result_clusters.append(clean_cluster)
+    
+    if not problem_rows.empty:
+        print(f"Processing {len(problem_rows)} problem rows with final_label violations")
+        
+        if 'final_label' in problem_rows.columns:
+            by_label = problem_rows.groupby('final_label')
+            
+            for label, label_group in by_label:
+                while len(label_group) > 0:
+                    if len(label_group) == 1:
+                        label_cluster = label_group
+                    else:
+                        label_cluster = label_group.iloc[:2]
+                        
+                    print(f"  - Creating small cluster for label {label}: {len(label_cluster)} rows")
+                    result_clusters.append(label_cluster)
+                    
+                    if len(label_group) <= 2:
+                        break
+                    label_group = label_group.iloc[2:]
+        else:
+            result_clusters.append(problem_rows)
+    
+    return result_clusters
 
 def split_cluster(df, num_segments):
     total_rows = len(df)
