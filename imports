@@ -6,8 +6,8 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
     
-    small_clusters = []
-    valid_clusters = []
+    output_clusters = []
+    batch_num = 1
     
     print(f"Processing JSON files from: {input_folder}")
     for filename in sorted(os.listdir(input_folder)):
@@ -16,69 +16,63 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
             
             try:
                 cluster_id = filename.split('.')[0]
+                print(f"\nProcessing: {filename}")
                 
                 df = pd.read_json(path_or_buf=file_path, orient='index')
                 
                 if 'final_label' in df.columns:
                     df['original_cluster'] = cluster_id
-                    df['final_label'] = df['final_label'].astype(str) + '_' + cluster_id
+                    # Do NOT modify final_label - keep original values to avoid duplicates
                 
                 filtered_df = df[df["final_sim_score"] > 0.92]
                 
                 pairs = len(filtered_df) // 2
                 print(f"File: {filename}, Pairs: {pairs}, Threshold: {threshold}")
                 
+                # Verify no final_label violations in input
                 if 'final_label' in filtered_df.columns:
                     final_label_counts = filtered_df.groupby('final_label').size()
                     max_count = final_label_counts.max() if not final_label_counts.empty else 0
                     if max_count > 2:
-                        print(f"WARNING: Input file {filename} violates final_label constraint (max: {max_count})")
+                        print(f"WARNING: Input file {filename} has final_label violations (max count: {max_count})")
+                        print(f"Fixing by keeping at most 2 rows per final_label...")
+                        filtered_df = enforce_final_label_constraint(filtered_df)
+                        pairs = len(filtered_df) // 2
+                        print(f"After fixing: {pairs} pairs")
                 
-                if pairs <= threshold and pairs >= min_threshold:
-                    print(f"KEEPING: {filename} is within size range ({pairs} pairs)")
-                    valid_clusters.append(filtered_df)
-                    
-                elif pairs > threshold:
-                    print(f"SPLITTING: {filename} exceeds threshold ({pairs} pairs)")
-                    
-                    num_segments = (pairs + threshold - 1) // threshold
+                # Decide how to handle this file based on size
+                if pairs <= threshold:
+                    # File is within or below threshold - keep as single cluster
+                    print(f"KEEPING intact: {pairs} pairs (within/below threshold)")
+                    output_clusters.append((filtered_df, cluster_id))
+                else:
+                    # File exceeds threshold - split while respecting final_label constraint
+                    print(f"SPLITTING: {pairs} pairs (exceeds threshold)")
+                    num_segments = (pairs + threshold - 1) // threshold  # Ceiling division
                     
                     if 'final_label' in filtered_df.columns:
                         split_clusters = split_by_final_label(filtered_df, num_segments)
                     else:
                         split_clusters = split_cluster(filtered_df, num_segments)
                     
-                    for i, cluster in enumerate(split_clusters):
-                        cluster_pairs = len(cluster) // 2
-                        print(f"  - Split {i+1}/{num_segments}: {cluster_pairs} pairs")
-                        
-                        if cluster_pairs >= min_threshold:
-                            valid_clusters.append(cluster)
-                        else:
-                            small_clusters.append(cluster)
-                            print(f"    - Added to small clusters pool ({cluster_pairs} pairs)")
-                    
-                else:
-                    print(f"SMALL CLUSTER: {filename} is below minimum threshold ({pairs} pairs)")
-                    small_clusters.append(filtered_df)
+                    for i, segment in enumerate(split_clusters):
+                        segment_pairs = len(segment) // 2
+                        print(f"  - Split {i+1}/{len(split_clusters)}: {segment_pairs} pairs")
+                        output_clusters.append((segment, f"{cluster_id}_split{i+1}"))
                     
             except Exception as e:
                 print(f"Error processing {filename}: {e}")
     
-    merged_clusters = []
-    if small_clusters:
-        print(f"MERGING: Processing {len(small_clusters)} small clusters")
-        merged_clusters = merge_small_clusters(small_clusters, min_threshold)
+    print("\nSaving all clusters...")
     
-    all_clusters = valid_clusters + merged_clusters
+    # Save all clusters
+    for cluster_df, source_id in output_clusters:
+        save_cluster(cluster_df, output_folder, batch_num, source_id)
+        batch_num += 1
     
-    final_clusters = resolve_final_label_violations(all_clusters)
+    print("\nValidating final outputs...")
     
-    saved_count = 0
-    for cluster in final_clusters:
-        saved_count += 1
-        save_cluster(cluster, output_folder, saved_count)
-    
+    # Final report
     saved_clusters_counts = {}
     final_label_violations = {}
     original_cluster_info = {}
@@ -127,66 +121,45 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
         print(f"\nWARNING: Found {len(final_label_violations)} clusters violating final_label constraint")
         for filename, violations in final_label_violations.items():
             print(f"  - {filename}: {violations}")
+        print("This should never happen with this algorithm. Please report this as a bug.")
 
-def resolve_final_label_violations(clusters):
-    result_clusters = []
-    problem_rows = pd.DataFrame()
+def enforce_final_label_constraint(df):
+    """
+    Ensure no more than 2 rows have the same final_label in the DataFrame.
+    For each final_label with more than 2 occurrences, keep only the first 2.
+    """
+    if 'final_label' not in df.columns:
+        return df
+        
+    # Check if constraint is already satisfied
+    label_counts = df.groupby('final_label').size()
+    if (label_counts <= 2).all():
+        return df
+        
+    # Identify labels with more than 2 occurrences
+    violations = label_counts[label_counts > 2]
+    print(f"Found {len(violations)} final_label violations to fix")
     
-    for cluster in clusters:
-        if 'final_label' not in cluster.columns:
-            result_clusters.append(cluster)
-            continue
-            
-        final_label_counts = cluster.groupby('final_label').size()
-        violations = final_label_counts[final_label_counts > 2]
-        
-        if violations.empty:
-            result_clusters.append(cluster)
-            continue
-            
-        print(f"Found cluster with {len(violations)} final_label violations")
-        clean_cluster = cluster.copy()
-        
-        for label in violations.index:
-            label_rows = clean_cluster[clean_cluster['final_label'] == label]
-            
-            if len(label_rows) > 2:
-                rows_to_keep = label_rows.iloc[:2]
-                rows_to_move = label_rows.iloc[2:]
-                
-                clean_cluster = clean_cluster[~clean_cluster.index.isin(rows_to_move.index)]
-                problem_rows = pd.concat([problem_rows, rows_to_move], ignore_index=True)
-                
-                print(f"  - Extracted {len(rows_to_move)} excess rows for label {label}")
-        
-        if not clean_cluster.empty:
-            result_clusters.append(clean_cluster)
+    # Create a clean DataFrame with at most 2 rows per final_label
+    result_df = pd.DataFrame(columns=df.columns)
     
-    if not problem_rows.empty:
-        print(f"Processing {len(problem_rows)} problem rows with final_label violations")
-        
-        if 'final_label' in problem_rows.columns:
-            by_label = problem_rows.groupby('final_label')
-            
-            for label, label_group in by_label:
-                while len(label_group) > 0:
-                    if len(label_group) == 1:
-                        label_cluster = label_group
-                    else:
-                        label_cluster = label_group.iloc[:2]
-                        
-                    print(f"  - Creating small cluster for label {label}: {len(label_cluster)} rows")
-                    result_clusters.append(label_cluster)
-                    
-                    if len(label_group) <= 2:
-                        break
-                    label_group = label_group.iloc[2:]
+    # Group by final_label and keep at most 2 rows from each group
+    grouped = df.groupby('final_label')
+    
+    for label, group in grouped:
+        if len(group) <= 2:
+            # No violation for this label, keep all rows
+            result_df = pd.concat([result_df, group], ignore_index=True)
         else:
-            result_clusters.append(problem_rows)
+            # Violation, keep only first 2 rows
+            result_df = pd.concat([result_df, group.iloc[:2]], ignore_index=True)
+            print(f"  - Kept 2/{len(group)} rows for label {label}")
     
-    return result_clusters
+    print(f"After enforcing constraint: {len(result_df)} rows (removed {len(df) - len(result_df)} rows)")
+    return result_df
 
 def split_cluster(df, num_segments):
+    """Split a DataFrame into roughly equal segments."""
     total_rows = len(df)
     segment_size = total_rows // num_segments
     segments = []
@@ -200,133 +173,64 @@ def split_cluster(df, num_segments):
     return segments
 
 def split_by_final_label(df, num_segments):
+    """Split a DataFrame while respecting the final_label constraint."""
     if 'final_label' not in df.columns:
         return split_cluster(df, num_segments)
     
+    # Ensure input has no violations
+    df = enforce_final_label_constraint(df)
+    
+    # Get all unique final_labels
     unique_labels = df['final_label'].unique()
+    
+    # Initialize segments
     segments = [pd.DataFrame(columns=df.columns) for _ in range(num_segments)]
     
-    for label in unique_labels:
-        label_rows = df[df['final_label'] == label]
-        
-        if len(label_rows) <= 2:
-            smallest_idx = min(range(len(segments)), key=lambda i: len(segments[i]))
-            segments[smallest_idx] = pd.concat([segments[smallest_idx], label_rows], ignore_index=True)
-        else:
-            for i, row in enumerate(label_rows.itertuples()):
-                segment_counts = [len(segments[j][segments[j]['final_label'] == label]) for j in range(len(segments))]
-                target_segment = segment_counts.index(min(segment_counts))
-                
-                if segment_counts[target_segment] >= 2:
-                    target_segment = min(range(len(segments)), key=lambda j: len(segments[j]))
-                
-                row_dict = {col: getattr(row, col) for col in df.columns if hasattr(row, col)}
-                segments[target_segment] = pd.concat([segments[target_segment], pd.DataFrame([row_dict])], ignore_index=True)
+    # Group rows by final_label
+    grouped = df.groupby('final_label')
     
+    # Distribute final_labels across segments
+    for i, (label, group) in enumerate(grouped):
+        # Always keep all rows with the same final_label in the SAME segment
+        # Assign to segment with minimum current size
+        target_segment = min(range(len(segments)), key=lambda i: len(segments[i]))
+        segments[target_segment] = pd.concat([segments[target_segment], group], ignore_index=True)
+    
+    # Remove any empty segments
     segments = [segment for segment in segments if not segment.empty]
     
+    # Try to balance segment sizes
     if len(segments) > 1:
         min_size = min(len(segment) for segment in segments)
         max_size = max(len(segment) for segment in segments)
         
-        if max_size - min_size > 10:
-            print(f"  - Balancing segments (size range: {min_size}-{max_size})")
-            segments.sort(key=len, reverse=True)
-            
-            for i in range(len(segments) - 1):
-                if len(segments[i]) - len(segments[-1]) <= 5:
-                    break
-                
-                for idx, row in segments[i].iterrows():
-                    label = row['final_label']
-                    if len(segments[-1][segments[-1]['final_label'] == label]) < 2:
-                        segments[-1] = pd.concat([segments[-1], row.to_frame().T], ignore_index=True)
-                        segments[i] = segments[i].drop(idx)
-                        break
+        if max_size - min_size > 20:
+            print(f"  - Note: Segments are unbalanced (size range: {min_size//2}-{max_size//2} pairs)")
+            print(f"  - This is expected when keeping final_labels together")
+    
+    # Report final sizes
+    for i, segment in enumerate(segments):
+        segment_label_counts = segment.groupby('final_label').size()
+        max_count = segment_label_counts.max() if not segment_label_counts.empty else 0
+        print(f"  - Segment {i+1}: {len(segment)//2} pairs, max final_label count: {max_count}")
     
     return segments
 
-def merge_small_clusters(clusters, min_threshold):
-    if not clusters:
-        return []
+def save_cluster(df, output_folder, batch_num, source_id):
+    """Save a cluster to a JSON file with verification."""
+    # Final verification of constraint
+    if 'final_label' in df.columns:
+        final_label_counts = df.groupby('final_label').size()
+        violations = final_label_counts[final_label_counts > 2]
+        if not violations.empty:
+            print(f"WARNING: Found violations before saving cluster {batch_num}, fixing...")
+            df = enforce_final_label_constraint(df)
     
-    clusters_with_pairs = [(cluster, len(cluster) // 2) for cluster in clusters]
-    sorted_clusters = sorted(clusters_with_pairs, key=lambda x: x[1], reverse=True)
-    
-    if len(sorted_clusters) == 1:
-        print(f"Only one small cluster ({sorted_clusters[0][1]} pairs), keeping as is")
-        return [sorted_clusters[0][0]]
-    
-    merged_clusters = []
-    remaining = sorted_clusters.copy()
-    
-    while len(remaining) >= 2:
-        base_cluster, base_pairs = remaining.pop(0)
-        
-        best_partner = None
-        best_partner_idx = -1
-        best_combined_pairs = 0
-        
-        for i, (partner, partner_pairs) in enumerate(remaining):
-            combined_pairs = base_pairs + partner_pairs
-            
-            if combined_pairs > min_threshold * 2:
-                continue
-                
-            if 'final_label' in base_cluster.columns and 'final_label' in partner.columns:
-                base_counts = base_cluster.groupby('final_label').size().to_dict()
-                partner_counts = partner.groupby('final_label').size().to_dict()
-                
-                violation = False
-                for label, count in base_counts.items():
-                    if label in partner_counts and count + partner_counts[label] > 2:
-                        violation = True
-                        break
-                
-                if violation:
-                    continue
-            
-            if combined_pairs > best_combined_pairs:
-                best_partner = partner
-                best_partner_idx = i
-                best_combined_pairs = combined_pairs
-        
-        if best_partner is not None:
-            merged = pd.concat([base_cluster, best_partner], ignore_index=True)
-            merged_pairs = len(merged) // 2
-            print(f"MERGED: {base_pairs} pairs + {remaining[best_partner_idx][1]} pairs = {merged_pairs} pairs")
-            
-            remaining.pop(best_partner_idx)
-            
-            if merged_pairs >= min_threshold:
-                merged_clusters.append(merged)
-            else:
-                remaining.append((merged, merged_pairs))
-                remaining.sort(key=lambda x: x[1], reverse=True)
-        else:
-            print(f"No compatible merge partner for cluster with {base_pairs} pairs")
-            merged_clusters.append(base_cluster)
-    
-    for cluster, pairs in remaining:
-        print(f"Keeping remaining unmerged cluster with {pairs} pairs")
-        merged_clusters.append(cluster)
-    
-    return merged_clusters
-
-def save_cluster(df, output_folder, batch_num):
     output_file = os.path.join(output_folder, f"Batch_rebalanced_{batch_num}.json")
     df.to_json(path_or_buf=output_file, orient='index', double_precision=10, indent=4, date_format='iso')
     
     pair_count = len(df) // 2
-    
-    if 'final_label' in df.columns:
-        final_label_counts = df.groupby('final_label').size()
-        max_count = final_label_counts.max() if not final_label_counts.empty else 0
-        violates_constraint = (final_label_counts > 2).any()
-        constraint_status = f"- VIOLATES final_label constraint (max count: {max_count})" if violates_constraint else ""
-        print(f"Saved Batch_rebalanced_{batch_num}.json: {pair_count} pairs {constraint_status}")
-    else:
-        print(f"Saved Batch_rebalanced_{batch_num}.json: {pair_count} pairs")
+    print(f"Saved Batch_rebalanced_{batch_num}.json: {pair_count} pairs (from {source_id})")
 
 if __name__ == "__main__":
     input_folder = "./input_json_files"
