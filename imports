@@ -10,27 +10,55 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
     small_clusters = []
     valid_clusters = []
     
+    # Track total row counts
+    total_input_rows = 0
+    processed_files = 0
+    
     print(f"Processing JSON files from: {input_folder}")
     for filename in sorted(os.listdir(input_folder)):
         if filename.endswith('.json'):
             file_path = os.path.join(input_folder, filename)
+            processed_files += 1
             
             try:
-                match = re.search(r'C(\d+)', filename)
+                # Enhanced pattern matching for cluster IDs
+                # Try pattern like "_C1.json" first
+                match = re.search(r'_C(\d+)', filename)
                 if match:
                     cluster_id = f"C{match.group(1)}"
                 else:
-                    cluster_id = filename.split('.')[0]
+                    # Try standard "C1" pattern next
+                    match = re.search(r'C(\d+)', filename)
+                    if match:
+                        cluster_id = f"C{match.group(1)}"
+                    else:
+                        # Fallback to original method if pattern not found
+                        cluster_id = filename.split('.')[0]  # Remove the .json extension
                 
                 print(f"Extracted cluster ID '{cluster_id}' from filename '{filename}'")
                 
+                # Read the JSON file as a DataFrame
                 df = pd.read_json(path_or_buf=file_path, orient='index')
+                total_input_rows += len(df)
                 
+                # Sample a few final_labels before modification for logging
+                original_labels = []
+                if 'final_label' in df.columns and not df.empty:
+                    original_labels = df['final_label'].iloc[:3].tolist()
+                    
+                # Add original cluster identifier to final_label if it exists
                 if 'final_label' in df.columns:
+                    # Create a new column with original_cluster info
                     df['original_cluster'] = cluster_id
-                    # This is where we modify the final_label to include the cluster ID
+                    # Modify final_label to include original cluster
                     print(f"  - Modifying final_labels to include cluster ID '{cluster_id}'")
                     df['final_label'] = df['final_label'].astype(str) + '_' + cluster_id
+                    
+                    # Sample the modified labels to confirm change
+                    if not df.empty:
+                        modified_labels = df['final_label'].iloc[:3].tolist()
+                        print(f"  - Example labels before: {original_labels}")
+                        print(f"  - Example labels after:  {modified_labels}")
                 
                 filtered_df = df[df["final_sim_score"] > 0.92]
                 
@@ -92,8 +120,11 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
     all_clusters = valid_clusters + merged_clusters
     
     saved_count = 0
+    total_output_rows = 0
+    
     for cluster in all_clusters:
         saved_count += 1
+        total_output_rows += len(cluster)
         save_cluster(cluster, output_folder, saved_count)
     
     saved_clusters_counts = {}
@@ -117,6 +148,11 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
                     final_label_violations[filename] = violations.to_dict()
     
     print(f"\nREBALANCING SUMMARY:")
+    print(f"Total input files processed: {processed_files}")
+    print(f"Total input rows: {total_input_rows}")
+    print(f"Total output rows: {total_output_rows}")
+    print(f"Total input pairs: {total_input_rows // 2}")
+    print(f"Total output pairs: {total_output_rows // 2}")
     print(f"Total clusters created: {len(saved_clusters_counts)}")
     
     for filename, pair_count in sorted(saved_clusters_counts.items()):
@@ -145,12 +181,24 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
     if final_label_violations:
         print(f"\n===== FINAL_LABEL CONSTRAINT VIOLATIONS =====")
         print(f"Found {len(final_label_violations)} clusters with violations")
-        print(f"Note: Each final_label shown below includes the original cluster ID appended to it")
+        print(f"Note: Each final_label shown below includes the original cluster ID as a suffix")
         print(f"Format: 'original_label_cluster_id'")
         print(f"-------------------------------------------")
         
         for filename, violations in final_label_violations.items():
             print(f"File: {filename}")
+            
+            # Read the file to check labels
+            file_path = os.path.join(output_folder, filename)
+            try:
+                df = pd.read_json(file_path, orient='index')
+                if 'final_label' in df.columns:
+                    # Extract and show a sample of the actual final_labels in this file
+                    sample_labels = df['final_label'].unique()[:5]
+                    print(f"  Sample labels from file: {sample_labels}")
+            except Exception as e:
+                print(f"  Error reading file for sample labels: {e}")
+            
             for full_label, count in violations.items():
                 # This is the full modified label that includes the cluster ID
                 print(f"  - Violation: '{full_label}' appears {count} times (exceeds limit of 2)")
@@ -305,6 +353,18 @@ def merge_small_clusters(clusters, min_threshold, ideal_min=65):
 
 def save_cluster(df, output_folder, batch_num):
     output_file = os.path.join(output_folder, f"Batch_rebalanced_{batch_num}.json")
+    
+    # Before saving, check if final_label is properly formatted
+    if 'final_label' in df.columns:
+        # Count how many have underscores (should have cluster IDs)
+        with_underscore = df['final_label'].str.contains('_').sum()
+        print(f"  - {with_underscore} out of {len(df)} final_labels contain '_' (should indicate cluster ID)")
+        
+        # Sample a few labels for inspection
+        if not df.empty:
+            sample_labels = df['final_label'].iloc[:3].tolist()
+            print(f"  - Sample final_labels: {sample_labels}")
+    
     df.to_json(path_or_buf=output_file, orient='index', double_precision=10, indent=4, date_format='iso')
     
     pair_count = len(df) // 2
