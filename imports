@@ -1,72 +1,134 @@
 import os
 import json
 import pandas as pd
+import re  # Added for better pattern matching
 
-def process_input_folder(input_folder, output_folder, threshold=70, min_threshold=30):
+def process_input_folder(input_folder, output_folder, threshold=70, min_threshold=30, ideal_min=65, ideal_max=75):
+    """
+    Process JSON cluster files individually, then merge small clusters if possible.
+    
+    Args:
+        input_folder: Path to folder containing JSON files
+        output_folder: Path to save output cluster files
+        threshold: Maximum threshold for cluster size (default: 70 pairs)
+        min_threshold: Minimum threshold for cluster size (default: 30 pairs)
+        ideal_min: Minimum of ideal range (default: 65 pairs)
+        ideal_max: Maximum of ideal range (default: 75 pairs)
+    """
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
     
-    all_dfs = []
+    # List to collect small clusters for potential merging
+    small_clusters = []
+    valid_clusters = []
     
+    # Process each input file individually
     print(f"Processing JSON files from: {input_folder}")
     for filename in sorted(os.listdir(input_folder)):
         if filename.endswith('.json'):
             file_path = os.path.join(input_folder, filename)
             
             try:
-                # Extract cluster identifier from filename
-                import re
-                cluster_match = re.search(r'_C(\d+)', filename)
-                if cluster_match:
-                    cluster_id = 'C' + cluster_match.group(1)
+                # Extract cluster identifier from filename - IMPROVED
+                # Try to extract C followed by digits (common pattern)
+                match = re.search(r'C(\d+)', filename)
+                if match:
+                    cluster_id = f"C{match.group(1)}"
                 else:
-                    cluster_id = filename.split('.')[0]  # Use the whole name if pattern not found
+                    # Fallback to original method if pattern not found
+                    cluster_id = filename.split('.')[0]  # Remove the .json extension
                 
+                print(f"Extracted cluster ID '{cluster_id}' from filename '{filename}'")
+                
+                # Read the JSON file as a DataFrame
                 df = pd.read_json(path_or_buf=file_path, orient='index')
                 
+                # Add original cluster identifier to final_label if it exists
                 if 'final_label' in df.columns:
+                    # Create a new column with original_cluster info
                     df['original_cluster'] = cluster_id
+                    # Modify final_label to include original cluster
                     df['final_label'] = df['final_label'].astype(str) + '_' + cluster_id
                 
+                # Filter for high similarity scores
                 filtered_df = df[df["final_sim_score"] > 0.92]
                 
+                # Calculate pair count
                 pairs = len(filtered_df) // 2
                 print(f"File: {filename}, Pairs: {pairs}, Threshold: {threshold}")
                 
-                # Check and fix final_label constraint in input file
+                # Check final_label constraint in input file
                 if 'final_label' in filtered_df.columns:
-                    filtered_df = enforce_final_label_constraint(filtered_df)
+                    final_label_counts = filtered_df.groupby('final_label').size()
+                    max_count = final_label_counts.max() if not final_label_counts.empty else 0
+                    if max_count > 2:
+                        print(f"WARNING: Input file {filename} violates final_label constraint (max: {max_count})")
                 
-                all_dfs.append(filtered_df)
+                # Process based on size
+                if pairs <= threshold and pairs >= min_threshold:
+                    # Within acceptable range, add to valid clusters
+                    print(f"KEEPING: {filename} is within size range ({pairs} pairs)")
+                    valid_clusters.append(filtered_df)
+                    
+                elif pairs > threshold:
+                    # Too large, split into multiple files
+                    print(f"SPLITTING: {filename} exceeds threshold ({pairs} pairs)")
+                    
+                    # Calculate how many segments needed - IMPROVED
+                    # Target the middle of the ideal range
+                    ideal_size = (ideal_min + ideal_max) / 2
+                    # Calculate optimal number of segments to get close to ideal size
+                    optimal_segments = round(pairs / ideal_size)
+                    # Ensure we don't create segments that exceed threshold
+                    min_segments = (pairs + threshold - 1) // threshold  # Ceiling division
+                    num_segments = max(optimal_segments, min_segments)
+                    
+                    print(f"  - Creating {num_segments} segments (targeting {ideal_size} pairs per segment)")
+                    
+                    # Split the cluster
+                    if 'final_label' in filtered_df.columns:
+                        # Split while respecting final_label constraint
+                        split_clusters = split_by_final_label(filtered_df, num_segments)
+                    else:
+                        # Standard splitting
+                        split_clusters = split_cluster(filtered_df, num_segments)
+                    
+                    # Process each split cluster
+                    for i, cluster in enumerate(split_clusters):
+                        cluster_pairs = len(cluster) // 2
+                        in_ideal_range = ideal_min <= cluster_pairs <= ideal_max
+                        range_status = "IDEAL RANGE" if in_ideal_range else ""
+                        print(f"  - Split {i+1}/{num_segments}: {cluster_pairs} pairs {range_status}")
+                        
+                        if cluster_pairs >= min_threshold:
+                            # Large enough to be valid
+                            valid_clusters.append(cluster)
+                        else:
+                            # Too small, add to small_clusters for potential merging
+                            small_clusters.append(cluster)
+                            print(f"    - Added to small clusters pool ({cluster_pairs} pairs)")
+                    
+                else:
+                    # Too small, add to small_clusters for potential merging
+                    print(f"SMALL CLUSTER: {filename} is below minimum threshold ({pairs} pairs)")
+                    small_clusters.append(filtered_df)
                     
             except Exception as e:
                 print(f"Error processing {filename}: {e}")
     
-    # Combine all data into one DataFrame
-    if not all_dfs:
-        print("No valid data found in input files.")
-        return
-        
-    combined_df = pd.concat(all_dfs, ignore_index=True)
-    print(f"Combined data: {len(combined_df)} rows, {len(combined_df)//2} pairs")
+    # Process small clusters if any
+    merged_clusters = []
+    if small_clusters:
+        print(f"MERGING: Processing {len(small_clusters)} small clusters")
+        merged_clusters = merge_small_clusters(small_clusters, min_threshold, ideal_min)
     
-    # Ensure final_label constraint is satisfied in combined data
-    if 'final_label' in combined_df.columns:
-        combined_df = enforce_final_label_constraint(combined_df)
-    
-    # Rebalance the combined data
-    clusters = rebalance_combined_data(combined_df, threshold, min_threshold)
+    # Add merged clusters to valid clusters
+    all_clusters = valid_clusters + merged_clusters
     
     # Save all clusters
     saved_count = 0
-    for cluster in clusters:
+    for cluster in all_clusters:
         saved_count += 1
-        # Verify final_label constraint before saving
-        if 'final_label' in cluster.columns:
-            final_label_counts = cluster.groupby('final_label').size()
-            if (final_label_counts > 2).any():
-                print(f"WARNING: Found violations in cluster {saved_count} before saving, fixing...")
-                cluster = enforce_final_label_constraint(cluster)
         save_cluster(cluster, output_folder, saved_count)
     
     # Final report
@@ -80,10 +142,12 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
             df_saved = pd.read_json(file_path, orient='index')
             saved_clusters_counts[filename] = len(df_saved) // 2
             
+            # Collect original cluster information if available
             if 'original_cluster' in df_saved.columns:
                 original_clusters = df_saved['original_cluster'].unique()
                 original_cluster_info[filename] = list(original_clusters)
             
+            # Check final_label constraint
             if 'final_label' in df_saved.columns:
                 final_label_counts = df_saved.groupby('final_label').size()
                 violations = final_label_counts[final_label_counts > 2]
@@ -101,7 +165,10 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
             status.append(f"SMALL: below min threshold ({min_threshold})")
         elif pair_count > threshold:
             status.append(f"LARGE: above max threshold ({threshold})")
+        elif ideal_min <= pair_count <= ideal_max:
+            status.append(f"IDEAL: within ideal range ({ideal_min}-{ideal_max})")
         
+        # Add original cluster info
         if filename in original_cluster_info:
             if len(original_cluster_info[filename]) == 1:
                 orig_info = f"from {original_cluster_info[filename][0]}"
@@ -114,187 +181,221 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
         origin_str = f" ({orig_info})" if orig_info else ""
         print(f"{filename}: {pair_count} pairs{status_str}{origin_str}")
     
+    # Report constraint violations
     if final_label_violations:
         print(f"\nWARNING: Found {len(final_label_violations)} clusters violating final_label constraint")
         for filename, violations in final_label_violations.items():
             print(f"  - {filename}: {violations}")
-        print("This should never happen with the current algorithm. Please report this bug.")
 
-def enforce_final_label_constraint(df):
+def split_cluster(df, num_segments):
     """
-    Ensure no more than 2 rows have the same final_label in the DataFrame.
-    For each final_label with more than 2 occurrences, keep only the first 2.
-    
-    Args:
-        df: DataFrame to process
-        
-    Returns:
-        DataFrame with at most 2 rows per final_label
-    """
-    if 'final_label' not in df.columns:
-        return df
-        
-    # Check if constraint is already satisfied
-    label_counts = df.groupby('final_label').size()
-    if (label_counts <= 2).all():
-        return df
-        
-    # Identify labels with more than 2 occurrences
-    violations = label_counts[label_counts > 2]
-    print(f"Found {len(violations)} final_label violations to fix")
-    
-    # Create a clean DataFrame with at most 2 rows per final_label
-    result_df = pd.DataFrame(columns=df.columns)
-    
-    # Group by final_label and keep at most 2 rows from each group
-    grouped = df.groupby('final_label')
-    
-    for label, group in grouped:
-        if len(group) <= 2:
-            # No violation for this label, keep all rows
-            result_df = pd.concat([result_df, group], ignore_index=True)
-        else:
-            # Violation, keep only first 2 rows
-            result_df = pd.concat([result_df, group.iloc[:2]], ignore_index=True)
-            print(f"  - Kept 2/{len(group)} rows for label {label}")
-    
-    print(f"After enforcing constraint: {len(result_df)} rows (removed {len(df) - len(result_df)} rows)")
-    return result_df
-
-def rebalance_combined_data(df, threshold, min_threshold):
-    """
-    Rebalance the combined data into appropriately sized clusters.
-    
-    Args:
-        df: Combined DataFrame
-        threshold: Maximum cluster size (pairs)
-        min_threshold: Minimum cluster size (pairs)
-        
-    Returns:
-        List of DataFrames representing rebalanced clusters
-    """
-    total_pairs = len(df) // 2
-    print(f"Rebalancing {total_pairs} total pairs")
-    
-    # If total size is below threshold, return as single cluster
-    if total_pairs <= threshold:
-        return [df]
-    
-    # Calculate how many clusters we need
-    num_clusters = (total_pairs + threshold - 1) // threshold  # Ceiling division
-    print(f"Creating {num_clusters} balanced clusters")
-    
-    # If we have final_label column, use special splitting
-    if 'final_label' in df.columns:
-        return split_respecting_final_label(df, num_clusters)
-    else:
-        # Simple equal-sized splitting
-        return split_into_equal_clusters(df, num_clusters)
-
-def split_into_equal_clusters(df, num_clusters):
-    """
-    Split data into roughly equal-sized clusters.
+    Split a cluster into roughly equal segments.
     
     Args:
         df: DataFrame to split
-        num_clusters: Number of clusters to create
+        num_segments: Number of segments to create
         
     Returns:
         List of DataFrames
     """
-    segment_size = len(df) // num_clusters
-    clusters = []
+    total_rows = len(df)
+    segment_size = total_rows // num_segments
+    segments = []
     
-    for i in range(num_clusters):
+    for i in range(num_segments):
         start_idx = i * segment_size
-        end_idx = (i + 1) * segment_size if i < num_clusters - 1 else len(df)
-        cluster = df.iloc[start_idx:end_idx].copy()
-        clusters.append(cluster)
-        print(f"  - Cluster {i+1}: {len(cluster)//2} pairs")
+        end_idx = (i + 1) * segment_size if i < num_segments - 1 else total_rows
+        segment = df.iloc[start_idx:end_idx].copy()
+        segments.append(segment)
     
-    return clusters
+    return segments
 
-def split_respecting_final_label(df, num_clusters):
+def split_by_final_label(df, num_segments):
     """
-    Split data into clusters while respecting the final_label constraint.
+    Split a DataFrame while respecting the final_label constraint.
     
     Args:
         df: DataFrame to split
-        num_clusters: Target number of clusters
+        num_segments: Target number of segments
         
     Returns:
         List of DataFrames
     """
-    # First, ensure no more than 2 rows per final_label in the entire dataset
-    df = enforce_final_label_constraint(df)
+    # If no final_label column, use standard splitting
+    if 'final_label' not in df.columns:
+        return split_cluster(df, num_segments)
     
-    # Initialize empty clusters
-    clusters = [pd.DataFrame(columns=df.columns) for _ in range(num_clusters)]
+    # Get all unique final_labels
+    unique_labels = df['final_label'].unique()
+    
+    # Initialize segments
+    segments = [pd.DataFrame(columns=df.columns) for _ in range(num_segments)]
     
     # Group rows by final_label
-    grouped = df.groupby('final_label')
-    
-    # Distribute rows with same final_label to same cluster when possible
-    for label, group in grouped:
-        # Always keep rows with same final_label together
-        # Find the cluster with the most available space
-        cluster_sizes = [len(cluster) for cluster in clusters]
-        target_cluster = cluster_sizes.index(min(cluster_sizes))
+    for label in unique_labels:
+        label_rows = df[df['final_label'] == label]
         
-        # Add all rows with this label to the target cluster
-        clusters[target_cluster] = pd.concat([clusters[target_cluster], group], ignore_index=True)
+        # For each label, distribute rows across segments
+        # ensuring no more than 2 rows with same label in any segment
+        if len(label_rows) <= 2:
+            # Can just add to the smallest segment
+            smallest_idx = min(range(len(segments)), key=lambda i: len(segments[i]))
+            segments[smallest_idx] = pd.concat([segments[smallest_idx], label_rows], ignore_index=True)
+        else:
+            # Need to distribute across segments
+            for i, row in enumerate(label_rows.itertuples()):
+                # Choose segment with fewest rows for this label
+                segment_counts = [len(segments[j][segments[j]['final_label'] == label]) for j in range(len(segments))]
+                target_segment = segment_counts.index(min(segment_counts))
+                
+                # If this segment already has 2 rows with this label, find another
+                if segment_counts[target_segment] >= 2:
+                    # Find segment with smallest total size
+                    target_segment = min(range(len(segments)), key=lambda j: len(segments[j]))
+                
+                # Add row to segment
+                row_dict = {col: getattr(row, col) for col in df.columns if hasattr(row, col)}
+                segments[target_segment] = pd.concat([segments[target_segment], pd.DataFrame([row_dict])], ignore_index=True)
     
-    # Balance cluster sizes if needed
-    min_size = min(len(cluster) for cluster in clusters)
-    max_size = max(len(cluster) for cluster in clusters)
+    # Ensure no empty segments
+    segments = [segment for segment in segments if not segment.empty]
     
-    # If clusters are too unbalanced, try to redistribute
-    if max_size - min_size > 20:  # Allow some imbalance
-        print(f"  - Balancing clusters (size range: {min_size//2}-{max_size//2} pairs)")
+    # Balance segment sizes if needed
+    if len(segments) > 1:
+        min_size = min(len(segment) for segment in segments)
+        max_size = max(len(segment) for segment in segments)
         
-        # Sort clusters by size (largest first)
-        clusters.sort(key=len, reverse=True)
-        
-        # Try to move rows from larger to smaller clusters
-        for i in range(len(clusters) - 1):
-            if len(clusters[i]) - len(clusters[-1]) <= 10:
-                break  # Close enough
+        if max_size - min_size > 10:
+            print(f"  - Balancing segments (size range: {min_size}-{max_size})")
+            # Sort by size (largest first)
+            segments.sort(key=len, reverse=True)
             
-            # Find labels that appear only in the larger cluster
-            if 'final_label' in clusters[i].columns:
-                labels_to_move = []
+            # Try to move rows from larger to smaller segments
+            for i in range(len(segments) - 1):
+                if len(segments[i]) - len(segments[-1]) <= 5:
+                    break  # Close enough
                 
-                # Get unique labels in this cluster
-                unique_labels = clusters[i]['final_label'].unique()
+                # Find rows that can be moved without violating constraint
+                for idx, row in segments[i].iterrows():
+                    label = row['final_label']
+                    # Check if we can move this row
+                    if len(segments[-1][segments[-1]['final_label'] == label]) < 2:
+                        # Can move this row
+                        segments[-1] = pd.concat([segments[-1], row.to_frame().T], ignore_index=True)
+                        segments[i] = segments[i].drop(idx)
+                        break
+    
+    return segments
+
+def merge_small_clusters(clusters, min_threshold, ideal_min=65):
+    """
+    Merge small clusters while respecting the final_label constraint.
+    
+    Args:
+        clusters: List of DataFrame clusters that are too small
+        min_threshold: Minimum threshold for cluster size
+        ideal_min: Target minimum for ideal range
+        
+    Returns:
+        List of merged DataFrame clusters
+    """
+    if not clusters:
+        return []
+    
+    # Add pair count and sort by size (largest first)
+    clusters_with_pairs = [(cluster, len(cluster) // 2) for cluster in clusters]
+    sorted_clusters = sorted(clusters_with_pairs, key=lambda x: x[1], reverse=True)
+    
+    # If only one small cluster, return it
+    if len(sorted_clusters) == 1:
+        print(f"Only one small cluster ({sorted_clusters[0][1]} pairs), keeping as is")
+        return [sorted_clusters[0][0]]
+    
+    merged_clusters = []
+    remaining = sorted_clusters.copy()
+    
+    # First attempt: merge pairs of clusters to reach minimum threshold or ideal range
+    while len(remaining) >= 2:
+        # Take the first remaining cluster
+        base_cluster, base_pairs = remaining.pop(0)
+        
+        # Find best merge partner
+        best_partner = None
+        best_partner_idx = -1
+        best_combined_pairs = 0
+        best_match_score = 0
+        
+        for i, (partner, partner_pairs) in enumerate(remaining):
+            combined_pairs = base_pairs + partner_pairs
+            
+            # Skip if combined size would exceed threshold significantly
+            if combined_pairs > min_threshold * 2:
+                continue
+            
+            # Calculate how close to the ideal range this merger would be
+            # Score is higher if closer to ideal_min without going over
+            if combined_pairs < ideal_min:
+                match_score = combined_pairs / ideal_min  # Score from 0 to 1
+            else:
+                match_score = 1.0  # Perfect score if in ideal range
                 
-                for label in unique_labels:
-                    label_rows = clusters[i][clusters[i]['final_label'] == label]
-                    
-                    # If this label doesn't appear in the smallest cluster, we can move it
-                    if len(clusters[-1]) == 0 or label not in clusters[-1]['final_label'].values:
-                        labels_to_move.append(label)
+            # Check if merging would violate final_label constraint
+            if 'final_label' in base_cluster.columns and 'final_label' in partner.columns:
+                base_counts = base_cluster.groupby('final_label').size().to_dict()
+                partner_counts = partner.groupby('final_label').size().to_dict()
                 
-                # Move rows for one label
-                if labels_to_move:
-                    label_to_move = labels_to_move[0]
-                    rows_to_move = clusters[i][clusters[i]['final_label'] == label_to_move]
-                    
-                    print(f"    - Moving {len(rows_to_move)} rows with label {label_to_move}")
-                    
-                    # Remove rows from source cluster
-                    clusters[i] = clusters[i][clusters[i]['final_label'] != label_to_move]
-                    
-                    # Add rows to target cluster
-                    clusters[-1] = pd.concat([clusters[-1], rows_to_move], ignore_index=True)
+                # Check for violations
+                violation = False
+                for label, count in base_counts.items():
+                    if label in partner_counts and count + partner_counts[label] > 2:
+                        violation = True
+                        break
+                
+                if violation:
+                    continue  # Skip this partner
+            
+            # If this is a valid merge and better than previous best
+            if match_score > best_match_score:
+                best_partner = partner
+                best_partner_idx = i
+                best_combined_pairs = combined_pairs
+                best_match_score = match_score
+        
+        # If we found a good partner
+        if best_partner is not None:
+            # Merge the clusters
+            merged = pd.concat([base_cluster, best_partner], ignore_index=True)
+            merged_pairs = len(merged) // 2
+            
+            # Indicate if in ideal range
+            ideal_range_status = ""
+            if merged_pairs >= ideal_min:
+                ideal_range_status = " (in ideal range!)"
+            
+            print(f"MERGED: {base_pairs} pairs + {remaining[best_partner_idx][1]} pairs = {merged_pairs} pairs{ideal_range_status}")
+            
+            # Remove the partner from remaining
+            remaining.pop(best_partner_idx)
+            
+            # If merged cluster is large enough, add to results
+            if merged_pairs >= min_threshold:
+                merged_clusters.append(merged)
+            else:
+                # Still too small, put back in remaining
+                remaining.append((merged, merged_pairs))
+                # Re-sort
+                remaining.sort(key=lambda x: x[1], reverse=True)
+        else:
+            # No good partner found, keep as is
+            print(f"No compatible merge partner for cluster with {base_pairs} pairs")
+            merged_clusters.append(base_cluster)
     
-    # Final resorting by size
-    clusters.sort(key=len, reverse=True)
+    # Add any remaining unmerged clusters
+    for cluster, pairs in remaining:
+        print(f"Keeping remaining unmerged cluster with {pairs} pairs")
+        merged_clusters.append(cluster)
     
-    # Report final sizes
-    for i, cluster in enumerate(clusters):
-        print(f"  - Cluster {i+1}: {len(cluster)//2} pairs")
-    
-    return clusters
+    return merged_clusters
 
 def save_cluster(df, output_folder, batch_num):
     """
@@ -310,6 +411,7 @@ def save_cluster(df, output_folder, batch_num):
     
     pair_count = len(df) // 2
     
+    # Check final_label constraint
     if 'final_label' in df.columns:
         final_label_counts = df.groupby('final_label').size()
         max_count = final_label_counts.max() if not final_label_counts.empty else 0
@@ -322,13 +424,16 @@ def save_cluster(df, output_folder, batch_num):
 if __name__ == "__main__":
     input_folder = "./input_json_files"
     output_folder = "./output_clusters"
-    threshold = 70
-    min_threshold = 30
+    threshold = 70  # Maximum cluster size (pairs)
+    min_threshold = 30  # Minimum cluster size (pairs)
+    ideal_min = 65  # Minimum of ideal range (pairs)
+    ideal_max = 75  # Maximum of ideal range (pairs)
     
     print(f"Starting cluster rebalancing with threshold: {threshold} pairs")
+    print(f"Ideal range: {ideal_min}-{ideal_max} pairs")
     print(f"Input folder: {input_folder}")
     print(f"Output folder: {output_folder}")
     
-    process_input_folder(input_folder, output_folder, threshold, min_threshold)
+    process_input_folder(input_folder, output_folder, threshold, min_threshold, ideal_min, ideal_max)
     
     print("Cluster rebalancing completed")
