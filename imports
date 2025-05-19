@@ -2,6 +2,7 @@ import os
 import json
 import pandas as pd
 import re
+from collections import defaultdict
 
 def process_input_folder(input_folder, output_folder, threshold=70, min_threshold=30, ideal_min=65, ideal_max=75):
     if not os.path.exists(output_folder):
@@ -22,7 +23,7 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
             
             try:
                 # Enhanced pattern matching for cluster IDs
-                # Try pattern like "_C1.json" first
+                # Try pattern like "_C5" specifically for files like "Batch_20250501_C5_chunk.json"
                 match = re.search(r'_C(\d+)', filename)
                 if match:
                     cluster_id = f"C{match.group(1)}"
@@ -119,6 +120,10 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
     
     all_clusters = valid_clusters + merged_clusters
     
+    # NEW: Fix final_label violations before saving
+    print("\n===== FIXING FINAL_LABEL VIOLATIONS =====")
+    all_clusters = fix_final_label_violations(all_clusters)
+    
     saved_count = 0
     total_output_rows = 0
     
@@ -211,6 +216,161 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
                         print(f"    (Original label '{orig_label}' from cluster '{cluster_id}')")
         
         print(f"-------------------------------------------")
+
+def fix_final_label_violations(clusters):
+    """
+    Fix final_label violations by redistributing records between clusters.
+    
+    Args:
+        clusters: List of DataFrame clusters
+        
+    Returns:
+        List of fixed DataFrame clusters
+    """
+    if not clusters:
+        return []
+    
+    # Check which clusters have violations
+    violating_clusters = []
+    clean_clusters = []
+    
+    for i, cluster in enumerate(clusters):
+        if 'final_label' not in cluster.columns:
+            clean_clusters.append(cluster)
+            continue
+            
+        final_label_counts = cluster.groupby('final_label').size()
+        violations = final_label_counts[final_label_counts > 2]
+        
+        if violations.empty:
+            clean_clusters.append(cluster)
+        else:
+            print(f"Found cluster with {len(violations)} final_label violations (cluster size: {len(cluster)})")
+            violating_clusters.append((i, cluster, violations))
+    
+    if not violating_clusters:
+        print("No final_label violations found in any clusters")
+        return clusters
+    
+    print(f"Found {len(violating_clusters)} clusters with violations. Attempting to fix...")
+    
+    # Records that need new homes
+    orphaned_records = []
+    
+    # Process each violating cluster
+    for original_idx, cluster, violations in violating_clusters:
+        print(f"Processing cluster #{original_idx} with {len(violations)} violations")
+        
+        # Extract violating records
+        for label, count in violations.items():
+            # We need to remove (count - 2) records with this label
+            records_to_remove = count - 2
+            print(f"  Need to relocate {records_to_remove} occurrences of label '{label}'")
+            
+            # Get indices of rows with this label
+            label_rows = cluster[cluster['final_label'] == label]
+            
+            # Remove the excess records (keep the first 2)
+            excess_records = label_rows.iloc[2:2+records_to_remove]
+            
+            # Add to orphaned records
+            for idx, row in excess_records.iterrows():
+                orphaned_records.append(row)
+            
+            # Remove from original cluster
+            cluster = cluster.drop(excess_records.index)
+        
+        # Update the cluster in the clean list
+        clean_clusters.append(cluster)
+    
+    print(f"Extracted {len(orphaned_records)} records that violate constraints")
+    
+    if not orphaned_records:
+        return clean_clusters
+    
+    # Convert orphaned records to DataFrame
+    orphan_df = pd.DataFrame(orphaned_records)
+    
+    # Group orphans by final_label
+    orphans_by_label = defaultdict(list)
+    for idx, row in orphan_df.iterrows():
+        label = row.get('final_label')
+        orphans_by_label[label].append(row)
+    
+    print(f"Orphaned records have {len(orphans_by_label)} distinct final_labels")
+    
+    # Try to place orphans in clean clusters
+    relocated_count = 0
+    remaining_orphans = []
+    
+    for label, records in orphans_by_label.items():
+        print(f"Finding homes for {len(records)} records with label '{label}'")
+        
+        for record in records:
+            placed = False
+            
+            # Try each clean cluster
+            for i, cluster in enumerate(clean_clusters):
+                if 'final_label' not in cluster.columns:
+                    continue
+                    
+                # Count occurrences of this label in the cluster
+                label_count = len(cluster[cluster['final_label'] == label])
+                
+                # Can we add this record without violating constraint?
+                if label_count < 2:
+                    # Yes, add it
+                    clean_clusters[i] = pd.concat([cluster, pd.DataFrame([record])], ignore_index=True)
+                    placed = True
+                    relocated_count += 1
+                    print(f"  Placed record with label '{label}' in cluster #{i} (now has {label_count + 1})")
+                    break
+            
+            if not placed:
+                remaining_orphans.append(record)
+    
+    print(f"Successfully relocated {relocated_count} records")
+    
+    # Handle any remaining orphans
+    if remaining_orphans:
+        print(f"Creating new clusters for {len(remaining_orphans)} records that couldn't be relocated")
+        
+        # Group remaining orphans by label
+        orphans_by_label = defaultdict(list)
+        for record in remaining_orphans:
+            label = record.get('final_label')
+            orphans_by_label[label].append(record)
+        
+        # Create new mini-clusters, ensuring no more than 2 records per label
+        mini_clusters = []
+        current_cluster = []
+        
+        # Keep track of labels in the current cluster
+        labels_in_cluster = defaultdict(int)
+        
+        for label, records in orphans_by_label.items():
+            for record in records:
+                # If adding this record would violate constraint, start a new cluster
+                if labels_in_cluster[label] >= 2:
+                    if current_cluster:
+                        mini_clusters.append(pd.DataFrame(current_cluster))
+                        current_cluster = []
+                        labels_in_cluster = defaultdict(int)
+                
+                # Add record to current cluster
+                current_cluster.append(record)
+                labels_in_cluster[label] += 1
+        
+        # Add the last cluster if not empty
+        if current_cluster:
+            mini_clusters.append(pd.DataFrame(current_cluster))
+        
+        print(f"Created {len(mini_clusters)} new small clusters for orphaned records")
+        
+        # Add mini-clusters to clean clusters
+        clean_clusters.extend(mini_clusters)
+    
+    return clean_clusters
 
 def split_cluster(df, num_segments):
     total_rows = len(df)
