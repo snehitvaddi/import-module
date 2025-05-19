@@ -29,6 +29,7 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
                 if 'final_label' in df.columns:
                     df['original_cluster'] = cluster_id
                     # This is where we modify the final_label to include the cluster ID
+                    print(f"  - Modifying final_labels to include cluster ID '{cluster_id}'")
                     df['final_label'] = df['final_label'].astype(str) + '_' + cluster_id
                 
                 filtered_df = df[df["final_sim_score"] > 0.92]
@@ -41,10 +42,9 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
                     max_count = final_label_counts.max() if not final_label_counts.empty else 0
                     if max_count > 2:
                         print(f"WARNING: Input file {filename} violates final_label constraint (max: {max_count})")
-                        # Show the specific violating labels with their full modified values
                         violations = final_label_counts[final_label_counts > 2]
                         for label, count in violations.items():
-                            print(f"  - Label '{label}' appears {count} times")
+                            print(f"  - Modified label '{label}' appears {count} times")
                 
                 if pairs <= threshold and pairs >= min_threshold:
                     print(f"KEEPING: {filename} is within size range ({pairs} pairs)")
@@ -143,12 +143,26 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
         print(f"{filename}: {pair_count} pairs{status_str}{origin_str}")
     
     if final_label_violations:
-        print(f"\nWARNING: Found {len(final_label_violations)} clusters violating final_label constraint")
+        print(f"\n===== FINAL_LABEL CONSTRAINT VIOLATIONS =====")
+        print(f"Found {len(final_label_violations)} clusters with violations")
+        print(f"Note: Each final_label shown below includes the original cluster ID appended to it")
+        print(f"Format: 'original_label_cluster_id'")
+        print(f"-------------------------------------------")
+        
         for filename, violations in final_label_violations.items():
-            print(f"  - {filename} violations:")
-            for label, count in violations.items():
-                # Display the full modified final_label that includes the cluster ID
-                print(f"    - Label '{label}' appears {count} times")
+            print(f"File: {filename}")
+            for full_label, count in violations.items():
+                # This is the full modified label that includes the cluster ID
+                print(f"  - Violation: '{full_label}' appears {count} times (exceeds limit of 2)")
+                
+                # Optionally extract the original parts
+                if '_' in full_label:
+                    parts = full_label.rsplit('_', 1)
+                    if len(parts) == 2:
+                        orig_label, cluster_id = parts
+                        print(f"    (Original label '{orig_label}' from cluster '{cluster_id}')")
+        
+        print(f"-------------------------------------------")
 
 def split_cluster(df, num_segments):
     total_rows = len(df)
@@ -302,10 +316,10 @@ def save_cluster(df, output_folder, batch_num):
         
         if violates_constraint:
             print(f"Saved Batch_rebalanced_{batch_num}.json: {pair_count} pairs - VIOLATES final_label constraint (max count: {max_count})")
-            # Show the specific violating labels with their full modified values
             violations = final_label_counts[final_label_counts > 2]
-            for label, count in violations.items():
-                print(f"  - Label '{label}' appears {count} times")
+            print(f"  Violations (full modified labels including cluster ID):")
+            for full_label, count in violations.items():
+                print(f"  - '{full_label}' appears {count} times (exceeds limit of 2)")
         else:
             print(f"Saved Batch_rebalanced_{batch_num}.json: {pair_count} pairs")
     else:
@@ -314,10 +328,10 @@ def save_cluster(df, output_folder, batch_num):
 if __name__ == "__main__":
     input_folder = "./input_json_files"
     output_folder = "./output_clusters"
-    threshold = 70  # Maximum cluster size (pairs)
-    min_threshold = 30  # Minimum cluster size (pairs)
-    ideal_min = 65  # Minimum of ideal range (pairs)
-    ideal_max = 75  # Maximum of ideal range (pairs)
+    threshold = 70
+    min_threshold = 30
+    ideal_min = 65
+    ideal_max = 75
     
     print(f"Starting cluster rebalancing with threshold: {threshold} pairs")
     print(f"Ideal range: {ideal_min}-{ideal_max} pairs")
