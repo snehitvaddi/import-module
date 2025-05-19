@@ -45,21 +45,31 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
                 # Sample a few final_labels before modification for logging
                 original_labels = []
                 if 'final_label' in df.columns and not df.empty:
-                    original_labels = df['final_label'].iloc[:3].tolist()
+                    try:
+                        original_labels = list(df['final_label'].iloc[:3])
+                    except Exception as e:
+                        print(f"  - Warning: Could not sample original labels: {e}")
                     
                 # Add original cluster identifier to final_label if it exists
                 if 'final_label' in df.columns:
                     # Create a new column with original_cluster info
                     df['original_cluster'] = cluster_id
+                    
+                    # FIXED: First ensure all final_labels are properly converted to strings
+                    df['final_label'] = df['final_label'].astype(str)
+                    
                     # Modify final_label to include original cluster
                     print(f"  - Modifying final_labels to include cluster ID '{cluster_id}'")
-                    df['final_label'] = df['final_label'].astype(str) + '_' + cluster_id
+                    df['final_label'] = df['final_label'] + '_' + cluster_id
                     
                     # Sample the modified labels to confirm change
                     if not df.empty:
-                        modified_labels = df['final_label'].iloc[:3].tolist()
-                        print(f"  - Example labels before: {original_labels}")
-                        print(f"  - Example labels after:  {modified_labels}")
+                        try:
+                            modified_labels = list(df['final_label'].iloc[:3])
+                            print(f"  - Example labels before: {original_labels}")
+                            print(f"  - Example labels after:  {modified_labels}")
+                        except Exception as e:
+                            print(f"  - Warning: Could not sample modified labels: {e}")
                 
                 filtered_df = df[df["final_sim_score"] > 0.92]
                 
@@ -67,13 +77,16 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
                 print(f"File: {filename}, Pairs: {pairs}, Threshold: {threshold}")
                 
                 if 'final_label' in filtered_df.columns:
-                    final_label_counts = filtered_df.groupby('final_label').size()
-                    max_count = final_label_counts.max() if not final_label_counts.empty else 0
-                    if max_count > 2:
-                        print(f"WARNING: Input file {filename} violates final_label constraint (max: {max_count})")
-                        violations = final_label_counts[final_label_counts > 2]
-                        for label, count in violations.items():
-                            print(f"  - Modified label '{label}' appears {count} times")
+                    try:
+                        final_label_counts = filtered_df.groupby('final_label').size()
+                        max_count = final_label_counts.max() if not final_label_counts.empty else 0
+                        if max_count > 2:
+                            print(f"WARNING: Input file {filename} violates final_label constraint (max: {max_count})")
+                            violations = final_label_counts[final_label_counts > 2]
+                            for label, count in violations.items():
+                                print(f"  - Modified label '{label}' appears {count} times")
+                    except Exception as e:
+                        print(f"  - Warning: Could not check for violations: {e}")
                 
                 if pairs <= threshold and pairs >= min_threshold:
                     print(f"KEEPING: {filename} is within size range ({pairs} pairs)")
@@ -139,18 +152,26 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
     for filename in sorted(os.listdir(output_folder)):
         if filename.endswith(".json"):
             file_path = os.path.join(output_folder, filename)
-            df_saved = pd.read_json(file_path, orient='index')
-            saved_clusters_counts[filename] = len(df_saved) // 2
-            
-            if 'original_cluster' in df_saved.columns:
-                original_clusters = df_saved['original_cluster'].unique()
-                original_cluster_info[filename] = list(original_clusters)
-            
-            if 'final_label' in df_saved.columns:
-                final_label_counts = df_saved.groupby('final_label').size()
-                violations = final_label_counts[final_label_counts > 2]
-                if not violations.empty:
-                    final_label_violations[filename] = violations.to_dict()
+            try:
+                df_saved = pd.read_json(file_path, orient='index')
+                saved_clusters_counts[filename] = len(df_saved) // 2
+                
+                if 'original_cluster' in df_saved.columns:
+                    original_clusters = df_saved['original_cluster'].unique()
+                    original_cluster_info[filename] = list(original_clusters)
+                
+                if 'final_label' in df_saved.columns:
+                    try:
+                        # Convert all final_labels to strings for consistent handling
+                        df_saved['final_label'] = df_saved['final_label'].astype(str)
+                        final_label_counts = df_saved.groupby('final_label').size()
+                        violations = final_label_counts[final_label_counts > 2]
+                        if not violations.empty:
+                            final_label_violations[filename] = violations.to_dict()
+                    except Exception as e:
+                        print(f"Error checking violations in {filename}: {e}")
+            except Exception as e:
+                print(f"Error reading saved file {filename}: {e}")
     
     print(f"\nREBALANCING SUMMARY:")
     print(f"Total input files processed: {processed_files}")
@@ -193,27 +214,36 @@ def process_input_folder(input_folder, output_folder, threshold=70, min_threshol
         for filename, violations in final_label_violations.items():
             print(f"File: {filename}")
             
-            # Read the file to check labels
+            # Read the file to check labels with improved error handling
             file_path = os.path.join(output_folder, filename)
             try:
                 df = pd.read_json(file_path, orient='index')
                 if 'final_label' in df.columns:
-                    # Extract and show a sample of the actual final_labels in this file
-                    sample_labels = df['final_label'].unique()[:5]
-                    print(f"  Sample labels from file: {sample_labels}")
+                    # Convert to list with error handling for non-iterables
+                    try:
+                        # Force conversion to strings first
+                        df['final_label'] = df['final_label'].astype(str)
+                        sample_labels = list(df['final_label'].unique())[:5]
+                        print(f"  Sample labels from file: {sample_labels}")
+                    except Exception as e:
+                        print(f"  Error getting sample labels: {e}")
             except Exception as e:
                 print(f"  Error reading file for sample labels: {e}")
             
+            # Process violations with enhanced error handling
             for full_label, count in violations.items():
-                # This is the full modified label that includes the cluster ID
-                print(f"  - Violation: '{full_label}' appears {count} times (exceeds limit of 2)")
-                
-                # Optionally extract the original parts
-                if '_' in full_label:
-                    parts = full_label.rsplit('_', 1)
-                    if len(parts) == 2:
-                        orig_label, cluster_id = parts
-                        print(f"    (Original label '{orig_label}' from cluster '{cluster_id}')")
+                try:
+                    print(f"  - Violation: '{full_label}' appears {count} times (exceeds limit of 2)")
+                    
+                    # Handle different data types safely
+                    full_label_str = str(full_label)
+                    if '_' in full_label_str:
+                        parts = full_label_str.rsplit('_', 1)
+                        if len(parts) == 2:
+                            orig_label, cluster_id = parts
+                            print(f"    (Original label '{orig_label}' from cluster '{cluster_id}')")
+                except Exception as e:
+                    print(f"  - Error processing violation for label: {e}")
         
         print(f"-------------------------------------------")
 
@@ -235,18 +265,26 @@ def fix_final_label_violations(clusters):
     clean_clusters = []
     
     for i, cluster in enumerate(clusters):
-        if 'final_label' not in cluster.columns:
-            clean_clusters.append(cluster)
-            continue
+        try:
+            if 'final_label' not in cluster.columns:
+                clean_clusters.append(cluster)
+                continue
             
-        final_label_counts = cluster.groupby('final_label').size()
-        violations = final_label_counts[final_label_counts > 2]
-        
-        if violations.empty:
+            # Ensure final_labels are converted to strings for consistent handling
+            cluster['final_label'] = cluster['final_label'].astype(str)
+                
+            final_label_counts = cluster.groupby('final_label').size()
+            violations = final_label_counts[final_label_counts > 2]
+            
+            if violations.empty:
+                clean_clusters.append(cluster)
+            else:
+                print(f"Found cluster with {len(violations)} final_label violations (cluster size: {len(cluster)})")
+                violating_clusters.append((i, cluster, violations))
+        except Exception as e:
+            print(f"Error checking for violations in cluster {i}: {e}")
+            # If there was an error checking violations, treat it as clean to be safe
             clean_clusters.append(cluster)
-        else:
-            print(f"Found cluster with {len(violations)} final_label violations (cluster size: {len(cluster)})")
-            violating_clusters.append((i, cluster, violations))
     
     if not violating_clusters:
         print("No final_label violations found in any clusters")
@@ -263,22 +301,25 @@ def fix_final_label_violations(clusters):
         
         # Extract violating records
         for label, count in violations.items():
-            # We need to remove (count - 2) records with this label
-            records_to_remove = count - 2
-            print(f"  Need to relocate {records_to_remove} occurrences of label '{label}'")
-            
-            # Get indices of rows with this label
-            label_rows = cluster[cluster['final_label'] == label]
-            
-            # Remove the excess records (keep the first 2)
-            excess_records = label_rows.iloc[2:2+records_to_remove]
-            
-            # Add to orphaned records
-            for idx, row in excess_records.iterrows():
-                orphaned_records.append(row)
-            
-            # Remove from original cluster
-            cluster = cluster.drop(excess_records.index)
+            try:
+                # We need to remove (count - 2) records with this label
+                records_to_remove = count - 2
+                print(f"  Need to relocate {records_to_remove} occurrences of label '{label}'")
+                
+                # Get indices of rows with this label
+                label_rows = cluster[cluster['final_label'] == label]
+                
+                # Remove the excess records (keep the first 2)
+                excess_records = label_rows.iloc[2:2+records_to_remove]
+                
+                # Add to orphaned records
+                for idx, row in excess_records.iterrows():
+                    orphaned_records.append(row.to_dict())  # Convert to dict for consistent handling
+                
+                # Remove from original cluster
+                cluster = cluster.drop(excess_records.index)
+            except Exception as e:
+                print(f"  Error processing violation for label '{label}': {e}")
         
         # Update the cluster in the clean list
         clean_clusters.append(cluster)
@@ -288,16 +329,25 @@ def fix_final_label_violations(clusters):
     if not orphaned_records:
         return clean_clusters
     
-    # Convert orphaned records to DataFrame
-    orphan_df = pd.DataFrame(orphaned_records)
-    
-    # Group orphans by final_label
-    orphans_by_label = defaultdict(list)
-    for idx, row in orphan_df.iterrows():
-        label = row.get('final_label')
-        orphans_by_label[label].append(row)
-    
-    print(f"Orphaned records have {len(orphans_by_label)} distinct final_labels")
+    # Convert orphaned records to DataFrame with error handling
+    try:
+        orphan_df = pd.DataFrame(orphaned_records)
+        
+        # Ensure final_label is string type
+        if 'final_label' in orphan_df.columns:
+            orphan_df['final_label'] = orphan_df['final_label'].astype(str)
+        
+        # Group orphans by final_label
+        orphans_by_label = defaultdict(list)
+        for idx, row in orphan_df.iterrows():
+            label = row.get('final_label', '')
+            orphans_by_label[label].append(row.to_dict())
+        
+        print(f"Orphaned records have {len(orphans_by_label)} distinct final_labels")
+    except Exception as e:
+        print(f"Error preparing orphaned records: {e}")
+        # If we had an error processing orphans, skip the redistribution
+        return clean_clusters
     
     # Try to place orphans in clean clusters
     relocated_count = 0
@@ -311,20 +361,27 @@ def fix_final_label_violations(clusters):
             
             # Try each clean cluster
             for i, cluster in enumerate(clean_clusters):
-                if 'final_label' not in cluster.columns:
-                    continue
+                try:
+                    if 'final_label' not in cluster.columns:
+                        continue
                     
-                # Count occurrences of this label in the cluster
-                label_count = len(cluster[cluster['final_label'] == label])
-                
-                # Can we add this record without violating constraint?
-                if label_count < 2:
-                    # Yes, add it
-                    clean_clusters[i] = pd.concat([cluster, pd.DataFrame([record])], ignore_index=True)
-                    placed = True
-                    relocated_count += 1
-                    print(f"  Placed record with label '{label}' in cluster #{i} (now has {label_count + 1})")
-                    break
+                    # Ensure consistent string comparison
+                    if 'final_label' in cluster.columns:
+                        cluster['final_label'] = cluster['final_label'].astype(str)
+                        
+                    # Count occurrences of this label in the cluster
+                    label_count = len(cluster[cluster['final_label'] == label])
+                    
+                    # Can we add this record without violating constraint?
+                    if label_count < 2:
+                        # Yes, add it
+                        clean_clusters[i] = pd.concat([cluster, pd.DataFrame([record])], ignore_index=True)
+                        placed = True
+                        relocated_count += 1
+                        print(f"  Placed record with label '{label}' in cluster #{i} (now has {label_count + 1})")
+                        break
+                except Exception as e:
+                    print(f"  Error checking cluster {i} for placement: {e}")
             
             if not placed:
                 remaining_orphans.append(record)
@@ -335,40 +392,43 @@ def fix_final_label_violations(clusters):
     if remaining_orphans:
         print(f"Creating new clusters for {len(remaining_orphans)} records that couldn't be relocated")
         
-        # Group remaining orphans by label
-        orphans_by_label = defaultdict(list)
-        for record in remaining_orphans:
-            label = record.get('final_label')
-            orphans_by_label[label].append(record)
-        
-        # Create new mini-clusters, ensuring no more than 2 records per label
-        mini_clusters = []
-        current_cluster = []
-        
-        # Keep track of labels in the current cluster
-        labels_in_cluster = defaultdict(int)
-        
-        for label, records in orphans_by_label.items():
-            for record in records:
-                # If adding this record would violate constraint, start a new cluster
-                if labels_in_cluster[label] >= 2:
-                    if current_cluster:
-                        mini_clusters.append(pd.DataFrame(current_cluster))
-                        current_cluster = []
-                        labels_in_cluster = defaultdict(int)
-                
-                # Add record to current cluster
-                current_cluster.append(record)
-                labels_in_cluster[label] += 1
-        
-        # Add the last cluster if not empty
-        if current_cluster:
-            mini_clusters.append(pd.DataFrame(current_cluster))
-        
-        print(f"Created {len(mini_clusters)} new small clusters for orphaned records")
-        
-        # Add mini-clusters to clean clusters
-        clean_clusters.extend(mini_clusters)
+        try:
+            # Group remaining orphans by label
+            orphans_by_label = defaultdict(list)
+            for record in remaining_orphans:
+                label = str(record.get('final_label', ''))
+                orphans_by_label[label].append(record)
+            
+            # Create new mini-clusters, ensuring no more than 2 records per label
+            mini_clusters = []
+            current_cluster = []
+            
+            # Keep track of labels in the current cluster
+            labels_in_cluster = defaultdict(int)
+            
+            for label, records in orphans_by_label.items():
+                for record in records:
+                    # If adding this record would violate constraint, start a new cluster
+                    if labels_in_cluster[label] >= 2:
+                        if current_cluster:
+                            mini_clusters.append(pd.DataFrame(current_cluster))
+                            current_cluster = []
+                            labels_in_cluster = defaultdict(int)
+                    
+                    # Add record to current cluster
+                    current_cluster.append(record)
+                    labels_in_cluster[label] += 1
+            
+            # Add the last cluster if not empty
+            if current_cluster:
+                mini_clusters.append(pd.DataFrame(current_cluster))
+            
+            print(f"Created {len(mini_clusters)} new small clusters for orphaned records")
+            
+            # Add mini-clusters to clean clusters
+            clean_clusters.extend(mini_clusters)
+        except Exception as e:
+            print(f"Error creating mini-clusters: {e}")
     
     return clean_clusters
 
@@ -388,6 +448,9 @@ def split_cluster(df, num_segments):
 def split_by_final_label(df, num_segments):
     if 'final_label' not in df.columns:
         return split_cluster(df, num_segments)
+    
+    # Ensure final_label is string type for consistent handling
+    df['final_label'] = df['final_label'].astype(str)
     
     unique_labels = df['final_label'].unique()
     segments = [pd.DataFrame(columns=df.columns) for _ in range(num_segments)]
@@ -466,16 +529,24 @@ def merge_small_clusters(clusters, min_threshold, ideal_min=65):
                 match_score = 1.0
                 
             if 'final_label' in base_cluster.columns and 'final_label' in partner.columns:
-                base_counts = base_cluster.groupby('final_label').size().to_dict()
-                partner_counts = partner.groupby('final_label').size().to_dict()
-                
-                violation = False
-                for label, count in base_counts.items():
-                    if label in partner_counts and count + partner_counts[label] > 2:
-                        violation = True
-                        break
-                
-                if violation:
+                try:
+                    # Ensure final_labels are string type for consistent comparison
+                    base_cluster['final_label'] = base_cluster['final_label'].astype(str)
+                    partner['final_label'] = partner['final_label'].astype(str)
+                    
+                    base_counts = base_cluster.groupby('final_label').size().to_dict()
+                    partner_counts = partner.groupby('final_label').size().to_dict()
+                    
+                    violation = False
+                    for label, count in base_counts.items():
+                        if label in partner_counts and count + partner_counts[label] > 2:
+                            violation = True
+                            break
+                    
+                    if violation:
+                        continue
+                except Exception as e:
+                    print(f"  Error checking constraint for potential merge: {e}")
                     continue
             
             if match_score > best_match_score:
@@ -485,22 +556,29 @@ def merge_small_clusters(clusters, min_threshold, ideal_min=65):
                 best_match_score = match_score
         
         if best_partner is not None:
-            merged = pd.concat([base_cluster, best_partner], ignore_index=True)
-            merged_pairs = len(merged) // 2
-            
-            ideal_range_status = ""
-            if merged_pairs >= ideal_min:
-                ideal_range_status = " (in ideal range!)"
-            
-            print(f"MERGED: {base_pairs} pairs + {remaining[best_partner_idx][1]} pairs = {merged_pairs} pairs{ideal_range_status}")
-            
-            remaining.pop(best_partner_idx)
-            
-            if merged_pairs >= min_threshold:
-                merged_clusters.append(merged)
-            else:
-                remaining.append((merged, merged_pairs))
-                remaining.sort(key=lambda x: x[1], reverse=True)
+            try:
+                merged = pd.concat([base_cluster, best_partner], ignore_index=True)
+                merged_pairs = len(merged) // 2
+                
+                ideal_range_status = ""
+                if merged_pairs >= ideal_min:
+                    ideal_range_status = " (in ideal range!)"
+                
+                print(f"MERGED: {base_pairs} pairs + {remaining[best_partner_idx][1]} pairs = {merged_pairs} pairs{ideal_range_status}")
+                
+                remaining.pop(best_partner_idx)
+                
+                if merged_pairs >= min_threshold:
+                    merged_clusters.append(merged)
+                else:
+                    remaining.append((merged, merged_pairs))
+                    remaining.sort(key=lambda x: x[1], reverse=True)
+            except Exception as e:
+                print(f"Error merging clusters: {e}")
+                # If merge failed, keep both clusters separate
+                merged_clusters.append(base_cluster)
+                merged_clusters.append(best_partner)
+                remaining.pop(best_partner_idx)
         else:
             print(f"No compatible merge partner for cluster with {base_pairs} pairs")
             merged_clusters.append(base_cluster)
@@ -516,34 +594,45 @@ def save_cluster(df, output_folder, batch_num):
     
     # Before saving, check if final_label is properly formatted
     if 'final_label' in df.columns:
-        # Count how many have underscores (should have cluster IDs)
-        with_underscore = df['final_label'].str.contains('_').sum()
-        print(f"  - {with_underscore} out of {len(df)} final_labels contain '_' (should indicate cluster ID)")
+        try:
+            # Ensure all final_labels are strings for consistent handling
+            df['final_label'] = df['final_label'].astype(str)
+            
+            # Count how many have underscores (should have cluster IDs)
+            with_underscore = df['final_label'].str.contains('_').sum()
+            print(f"  - {with_underscore} out of {len(df)} final_labels contain '_' (should indicate cluster ID)")
+            
+            # Sample a few labels for inspection
+            if not df.empty:
+                sample_labels = list(df['final_label'].iloc[:3])
+                print(f"  - Sample final_labels: {sample_labels}")
+        except Exception as e:
+            print(f"  - Warning: Could not verify final_labels: {e}")
+    
+    try:
+        df.to_json(path_or_buf=output_file, orient='index', double_precision=10, indent=4, date_format='iso')
         
-        # Sample a few labels for inspection
-        if not df.empty:
-            sample_labels = df['final_label'].iloc[:3].tolist()
-            print(f"  - Sample final_labels: {sample_labels}")
-    
-    df.to_json(path_or_buf=output_file, orient='index', double_precision=10, indent=4, date_format='iso')
-    
-    pair_count = len(df) // 2
-    
-    if 'final_label' in df.columns:
-        final_label_counts = df.groupby('final_label').size()
-        max_count = final_label_counts.max() if not final_label_counts.empty else 0
-        violates_constraint = (final_label_counts > 2).any()
+        pair_count = len(df) // 2
         
-        if violates_constraint:
-            print(f"Saved Batch_rebalanced_{batch_num}.json: {pair_count} pairs - VIOLATES final_label constraint (max count: {max_count})")
-            violations = final_label_counts[final_label_counts > 2]
-            print(f"  Violations (full modified labels including cluster ID):")
-            for full_label, count in violations.items():
-                print(f"  - '{full_label}' appears {count} times (exceeds limit of 2)")
+        if 'final_label' in df.columns:
+            # Ensure final_labels are strings
+            df['final_label'] = df['final_label'].astype(str)
+            final_label_counts = df.groupby('final_label').size()
+            max_count = final_label_counts.max() if not final_label_counts.empty else 0
+            violates_constraint = (final_label_counts > 2).any()
+            
+            if violates_constraint:
+                print(f"Saved Batch_rebalanced_{batch_num}.json: {pair_count} pairs - VIOLATES final_label constraint (max count: {max_count})")
+                violations = final_label_counts[final_label_counts > 2]
+                print(f"  Violations (full modified labels including cluster ID):")
+                for full_label, count in violations.items():
+                    print(f"  - '{full_label}' appears {count} times (exceeds limit of 2)")
+            else:
+                print(f"Saved Batch_rebalanced_{batch_num}.json: {pair_count} pairs")
         else:
             print(f"Saved Batch_rebalanced_{batch_num}.json: {pair_count} pairs")
-    else:
-        print(f"Saved Batch_rebalanced_{batch_num}.json: {pair_count} pairs")
+    except Exception as e:
+        print(f"Error saving cluster to {output_file}: {e}")
 
 if __name__ == "__main__":
     input_folder = "./input_json_files"
